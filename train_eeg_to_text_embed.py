@@ -8,6 +8,7 @@ import sys
 import math
 import random
 from typing import List, Tuple
+from simple_experiment_logger import SimpleExperimentLogger
 
 import matplotlib.pyplot as plt
 import torch
@@ -146,25 +147,32 @@ class EEGToTextEmbedModel(nn.Module):
 
 def make_split_indices(cfg, sentences, subj_ids):
     """
-    Returns: train_idx, val_idx as lists of integers (trial indices)
+    Returns: train_idx, val_idx, split_info
     """
     n = len(sentences)
 
     if cfg.SPLIT_MODE == "iid":
-        return make_train_val_indices(n, cfg.VAL_SPLIT, cfg.SHUFFLE_DATA, cfg.RANDOM_SEED)
+        train_idx, val_idx = make_train_val_indices(n, cfg.VAL_SPLIT, cfg.SHUFFLE_DATA, cfg.RANDOM_SEED)
+        split_info = {"split_mode": "iid", "val_split": cfg.VAL_SPLIT, "seed": cfg.RANDOM_SEED}
+        return train_idx, val_idx, split_info
 
     elif cfg.SPLIT_MODE == "unseen_subject":
-        # Map subject code strings (e.g. "05") -> subject index (0-based)
         code_to_idx = {code: i for i, code in enumerate(cfg.SUBJECT_CODES)}
         holdout_ids = {code_to_idx[c] for c in cfg.HOLDOUT_SUBJECTS}
 
         val_idx = [i for i in range(n) if int(subj_ids[i]) in holdout_ids]
         train_idx = [i for i in range(n) if int(subj_ids[i]) not in holdout_ids]
         print(f"Held out subjects {cfg.HOLDOUT_SUBJECTS} -> val trials: {len(val_idx)}")
-        return train_idx, val_idx
+
+        split_info = {
+            "split_mode": "unseen_subject",
+            "holdout_subjects": list(cfg.HOLDOUT_SUBJECTS),
+            "holdout_subject_indices": sorted(list(holdout_ids)),
+            "seed": cfg.RANDOM_SEED,
+        }
+        return train_idx, val_idx, split_info
 
     elif cfg.SPLIT_MODE == "unseen_sentence":
-        # Hold out entire sentence identities (not trials)
         rng = random.Random(cfg.RANDOM_SEED)
         unique_sents = sorted(set(sentences))
         rng.shuffle(unique_sents)
@@ -175,11 +183,17 @@ def make_split_indices(cfg, sentences, subj_ids):
         val_idx = [i for i, s in enumerate(sentences) if s in holdout_sents]
         train_idx = [i for i, s in enumerate(sentences) if s not in holdout_sents]
         print(f"Held out {n_holdout}/{len(unique_sents)} sentences -> val trials: {len(val_idx)}")
-        return train_idx, val_idx
+
+        split_info = {
+            "split_mode": "unseen_sentence",
+            "holdout_fraction": cfg.HOLDOUT_SENT_FRACTION,
+            "holdout_count": n_holdout,
+            "seed": cfg.RANDOM_SEED,
+        }
+        return train_idx, val_idx, split_info
 
     else:
         raise ValueError(f"Unknown SPLIT_MODE: {cfg.SPLIT_MODE}")
-
 
 # ----------------- Data prep: EEG + text embeddings -----------------
 
@@ -392,10 +406,20 @@ def main():
     print(f"text_dim = {text_dim}")
 
     # 2) Train/val split
-    train_idx, val_idx = make_split_indices(cfg, sentences, subj_ids)
+    train_idx, val_idx, split_info = make_split_indices(cfg, sentences, subj_ids)
 
+    logger = SimpleExperimentLogger(
+        root="experiments",
+        task_name="eeg2text",
+        config={k: getattr(cfg, k) for k in dir(cfg) if k.isupper()},
+        split_info=split_info,
+        metric_name="val_acc10",
+        higher_is_better=True,
+        run_tag=f"task={'read'}",  # change if needed
+    )
+    print("Logging to:", logger.run_dir)
 
-    # 3) Build datasets: augmentation ON for train, OFF for val
+    # 3) Build datasets
     train_dataset = ChiscoImagineDataset(
         eeg=X[train_idx],
         sentences=[sentences[i] for i in train_idx],
@@ -459,8 +483,9 @@ def main():
         num_training_steps=total_steps,
     )
 
-    # 5) Training loop with history
-    best_val_acc10 = 0.0
+    # 5) Training loop
+    best_val_acc10 = -1e9
+
     train_loss_hist = []
     val_loss_hist = []
     val_acc1_hist = []
@@ -483,32 +508,79 @@ def main():
             f"| Acc@5 {val_acc5:.2f}% | Acc@10 {val_acc10:.2f}%"
         )
 
+        # ---- LOGGER: record metrics for this epoch ----
+        logger.log_epoch(
+            epoch=epoch,
+            train_stats={"loss": float(train_loss)},
+            val_stats={
+                "loss": float(val_loss),
+                "acc1": float(val_acc1),
+                "acc5": float(val_acc5),
+                "acc10": float(val_acc10),
+            },
+        )
+
+        # ---- LOGGER: save last checkpoint every epoch ----
+        logger.save_last(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "config": cfg.__dict__,
+                "split_info": split_info,
+                "train": {"loss": float(train_loss)},
+                "val": {
+                    "loss": float(val_loss),
+                    "acc1": float(val_acc1),
+                    "acc5": float(val_acc5),
+                    "acc10": float(val_acc10),
+                },
+            }
+        )
+
+        # ---- LOGGER: save best checkpoint when Acc@10 improves ----
+        if val_acc10 > best_val_acc10:
+            best_val_acc10 = val_acc10
+
+            did_save = logger.maybe_save_best(
+                epoch=epoch,
+                metric_value=float(val_acc10),
+                checkpoint={
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "config": cfg.__dict__,
+                    "split_info": split_info,
+                    "best_val_acc10": float(best_val_acc10),
+                    "train": {"loss": float(train_loss)},
+                    "val": {
+                        "loss": float(val_loss),
+                        "acc1": float(val_acc1),
+                        "acc5": float(val_acc5),
+                        "acc10": float(val_acc10),
+                    },
+                },
+            )
+
+            if did_save:
+                print(
+                    f"Saved NEW BEST -> {logger.run_dir}/best_checkpoint.pt "
+                    f"(val_acc@10={best_val_acc10:.2f}%)"
+                )
+
         train_loss_hist.append(train_loss)
         val_loss_hist.append(val_loss)
         val_acc1_hist.append(val_acc1)
         val_acc5_hist.append(val_acc5)
         val_acc10_hist.append(val_acc10)
 
-        if val_acc10 > best_val_acc10:
-            best_val_acc10 = val_acc10
-            os.makedirs("checkpoints", exist_ok=True)
-            ckpt_path = os.path.join("checkpoints", "best_eeg2text_model.pt")
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": cfg.__dict__,
-                    "best_val_acc10": best_val_acc10,
-                },
-                ckpt_path,
-            )
-            print(f"Saved new best model to {ckpt_path} (val_acc@10={best_val_acc10:.2f}%)")
-
-    # 6) Plot loss and metrics
-    os.makedirs("plots", exist_ok=True)
+    # 6) Plot loss and metrics (unchanged)
+    plots_dir = os.path.join(logger.run_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
     epochs = range(1, cfg.NUM_EPOCHS + 1)
 
-    # Loss
     plt.figure()
     plt.plot(epochs, train_loss_hist, label="Train Loss")
     plt.plot(epochs, val_loss_hist, label="Val Loss")
@@ -518,10 +590,9 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("plots/eeg2text_loss_curve.png")
+    plt.savefig(os.path.join(plots_dir, "eeg2text_loss_curve.png"))
     plt.close()
 
-    # Acc@k
     plt.figure()
     plt.plot(epochs, val_acc1_hist, label="Val Acc@1")
     plt.plot(epochs, val_acc5_hist, label="Val Acc@5")
@@ -532,14 +603,11 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("plots/eeg2text_acc_curve.png")
+    plt.savefig(os.path.join(plots_dir, "eeg2text_acc_curve.png"))
     plt.close()
 
     print(f"\nTraining finished. Best val Acc@10: {best_val_acc10:.2f}%")
-    print("Saved plots to:")
-    print("  plots/eeg2text_loss_curve.png")
-    print("  plots/eeg2text_acc_curve.png")
-
+    print("Run directory:", logger.run_dir)
 
 if __name__ == "__main__":
     main()
