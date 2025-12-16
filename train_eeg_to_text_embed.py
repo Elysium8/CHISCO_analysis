@@ -34,7 +34,8 @@ class Config:
     CHISCO_ROOT = "./ds005170/derivatives/preprocessed_pkl"
     SENT_EMB_PATH = "./ds005170/json/sentence_bert_embs.json"  # <-- your precomputed embeddings
 
-    SPLIT_MODE = "iid"  # "iid" | "unseen_subject" | "unseen_sentence"
+    TASK = "read"  # "read" or "imagine"
+    SPLIT_MODE = "unseen_sentence"  # "iid" | "unseen_subject" | "unseen_sentence"
     HOLDOUT_SUBJECTS = ["05"]  # used when SPLIT_MODE="unseen_subject"
     HOLDOUT_SENT_FRACTION = 0.2  # used when SPLIT_MODE="unseen_sentence"
 
@@ -215,11 +216,13 @@ def build_eeg_text_embed_tensors(cfg: Config):
         subj_ids_kept: (N,) long tensor
         text_targets:  (N, D) float32 tensor of text embeddings
     """
-    print("Loading CHISCO imagine EEG + sentences...")
-    X, sentences, subj_ids = load_chisco_read_all_subjects(
-        root=cfg.CHISCO_ROOT,
-        subject_codes=cfg.SUBJECT_CODES,
-    )
+    print("Loading CHISCO ", cfg.TASK, " EEG + sentences...")
+    if cfg.TASK == "read":
+        X, sentences, subj_ids = load_chisco_read_all_subjects(root=cfg.CHISCO_ROOT, subject_codes=cfg.SUBJECT_CODES)
+    elif cfg.TASK == "imagine":
+        X, sentences, subj_ids = load_chisco_imagine_all_subjects(root=cfg.CHISCO_ROOT, subject_codes=cfg.SUBJECT_CODES)
+    else:
+        raise ValueError("TASK must be 'read' or 'imagine'")
     print(f"Loaded {X.shape[0]} trials, {X.shape[1]} channels, {X.shape[2]} timepoints.")
 
     print("Loading precomputed sentence embeddings...")
@@ -408,14 +411,17 @@ def main():
     # 2) Train/val split
     train_idx, val_idx, split_info = make_split_indices(cfg, sentences, subj_ids)
 
+    split_mode = split_info["split_mode"]  # "iid" | "unseen_subject" | "unseen_sentence"
+    task = cfg.TASK  # "read" | "imagine"
+
     logger = SimpleExperimentLogger(
         root="experiments",
-        task_name="eeg2text",
+        task_name=os.path.join("eeg2text", task, split_mode),
         config={k: getattr(cfg, k) for k in dir(cfg) if k.isupper()},
         split_info=split_info,
         metric_name="val_acc10",
         higher_is_better=True,
-        run_tag=f"task={'read'}",  # change if needed
+        run_tag=None,  # optional, since task+split are now in folders
     )
     print("Logging to:", logger.run_dir)
 
