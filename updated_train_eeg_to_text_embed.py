@@ -144,12 +144,23 @@ def make_split_indices(
 ) -> Tuple[List[int], List[int], Dict[str, Any]]:
     """
     Returns: train_idx, val_idx, split_info
+
+    Functionality is identical to the original version; the only change is that
+    we also store the explicit train/val indices inside split_info for exact reproducibility.
     """
     n = len(sentences)
 
     if split_mode == "iid":
         train_idx, val_idx = make_train_val_indices(n, val_split, shuffle, seed)
-        split_info = {"split_mode": "iid", "val_split": val_split, "seed": seed}
+        split_info = {
+            "split_mode": "iid",
+            "val_split": float(val_split),
+            "seed": int(seed),
+            "shuffle": bool(shuffle),
+            # NEW:
+            "train_idx": [int(i) for i in train_idx],
+            "val_idx": [int(i) for i in val_idx],
+        }
         print(f"Train size: {len(train_idx)}, val size: {len(val_idx)}")
         return train_idx, val_idx, split_info
 
@@ -165,7 +176,10 @@ def make_split_indices(
             "split_mode": "unseen_subject",
             "holdout_subjects": list(holdout_subjects),
             "holdout_subject_indices": sorted(list(holdout_ids)),
-            "seed": seed,
+            "seed": int(seed),
+            # NEW:
+            "train_idx": [int(i) for i in train_idx],
+            "val_idx": [int(i) for i in val_idx],
         }
         print(f"Held out subjects {holdout_subjects} -> val trials: {len(val_idx)}")
         print(f"Train size: {len(train_idx)}, val size: {len(val_idx)}")
@@ -184,9 +198,14 @@ def make_split_indices(
 
         split_info = {
             "split_mode": "unseen_sentence",
-            "holdout_fraction": holdout_sent_fraction,
-            "holdout_count": n_holdout,
-            "seed": seed,
+            "holdout_fraction": float(holdout_sent_fraction),
+            "holdout_count": int(n_holdout),
+            "seed": int(seed),
+            # NEW:
+            "train_idx": [int(i) for i in train_idx],
+            "val_idx": [int(i) for i in val_idx],
+            # Optional (doesn't change behavior, but nice for debugging):
+            # "holdout_sentences": sorted(list(holdout_sents)),
         }
         print(f"Held out {n_holdout}/{len(unique_sents)} sentences -> val trials: {len(val_idx)}")
         print(f"Train size: {len(train_idx)}, val size: {len(val_idx)}")
@@ -396,7 +415,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-epochs", type=int, default=30)
     p.add_argument("--learning-rate", type=float, default=5e-4)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--warmup-ratio", type=float, default=0.1)
     p.add_argument("--temperature", type=float, default=0.07)
     p.add_argument("--num-workers", type=int, default=4)
