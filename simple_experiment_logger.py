@@ -42,7 +42,7 @@ class SimpleExperimentLogger:
     ):
         ts = time.strftime("%Y-%m-%d_%H-%M-%S")
         split_mode = split_info.get("split_mode", "unknown")
-        seed = config.get("RANDOM_SEED", "na")
+        seed = config.get("seed", "na")
 
         run_id_parts = [ts, f"split={split_mode}", f"seed={seed}"]
         if run_tag:

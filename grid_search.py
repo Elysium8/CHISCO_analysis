@@ -24,7 +24,7 @@ TRAIN_SCRIPT = "updated_train_eeg_to_text_embed.py"
 # -------------------------------
 BASE_ARGS = {
     "--task": "read",                # FIXED context
-    "--split-mode": "iid",  # FIXED context
+    "--split-mode": "unseen_sentence",  # FIXED context
     "--batch-size": 64,
     "--num-epochs": 30,
     "--learning-rate": 5e-4,  # will be overridden
@@ -82,8 +82,10 @@ def main():
     print("TRUE GRID SEARCH")
     print(f"Task: {BASE_ARGS['--task']} | Split mode: {BASE_ARGS['--split-mode']}")
     print("=" * 80)
-
+    i = 0
     for combo in itertools.product(*values):
+        print(i)
+        i+=1
         args = deepcopy(BASE_ARGS)
         for k, v in zip(keys, combo):
             args[k] = v

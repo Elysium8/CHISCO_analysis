@@ -397,7 +397,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # Paths / data
     p.add_argument("--chisco-root", type=str, default="./ds005170/derivatives/preprocessed_pkl")
     p.add_argument("--sent-emb-path", type=str, default="./ds005170/json/sentence_bert_embs.json")
-    p.add_argument("--task", type=str, default="read", choices=["read", "imagine"])
+    p.add_argument("--task", type=str, default="imagine", choices=["read", "imagine"])
     p.add_argument("--subject-codes", type=str, default="01,02,03,04,05",
                    help="Comma-separated subject codes, e.g. 01,02,03,04,05")
 

@@ -26,7 +26,7 @@ def load_imagine_run(
     Returns:
         List of trial dicts (possibly empty if file missing).
     """
-    run_str = f"{run_idx:02d}"  # 1 -> "01"
+    run_str = f"{run_idx:03d}"  # 1 -> "01"
     fname = f"sub-{sub_code}_task-imagine_run-{run_str}_eeg.pkl"
     path = os.path.join(root, f"sub-{sub_code}", "eeg", fname)
 
