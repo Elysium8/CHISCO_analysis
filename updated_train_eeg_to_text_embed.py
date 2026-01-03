@@ -398,11 +398,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--chisco-root", type=str, default="./ds005170/derivatives/preprocessed_pkl")
     p.add_argument("--sent-emb-path", type=str, default="./ds005170/json/sentence_bert_embs.json")
     p.add_argument("--task", type=str, default="imagine", choices=["read", "imagine"])
-    p.add_argument("--subject-codes", type=str, default="01,02,03,04,05",
+    p.add_argument("--subject-codes", type=str, default="01",
                    help="Comma-separated subject codes, e.g. 01,02,03,04,05")
 
     # Split
-    p.add_argument("--split-mode", type=str, default="iid",
+    p.add_argument("--split-mode", type=str, default="unseen_sentence",
                    choices=["iid", "unseen_subject", "unseen_sentence"])
     p.add_argument("--val-split", type=float, default=0.2)
     p.add_argument("--shuffle-data", action=argparse.BooleanOptionalAction, default=True)
@@ -414,10 +414,10 @@ def build_argparser() -> argparse.ArgumentParser:
     # Training
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-epochs", type=int, default=30)
-    p.add_argument("--learning-rate", type=float, default=5e-4)
+    p.add_argument("--learning-rate", type=float, default=0.0003)
     p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--warmup-ratio", type=float, default=0.1)
-    p.add_argument("--temperature", type=float, default=0.07)
+    p.add_argument("--temperature", type=float, default=0.05)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--log-every-steps", type=int, default=50)
 

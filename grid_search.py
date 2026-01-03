@@ -17,7 +17,7 @@ from copy import deepcopy
 import sys
 
 PYTHON = sys.executable
-TRAIN_SCRIPT = "updated_train_eeg_to_text_embed.py"
+TRAIN_SCRIPT = "updated_train_eeg_to_text_RAM.py"
 
 # -------------------------------
 # Fixed base configuration
@@ -27,9 +27,9 @@ BASE_ARGS = {
     "--split-mode": "unseen_sentence",  # FIXED context
     "--batch-size": 64,
     "--num-epochs": 30,
-    "--learning-rate": 5e-4,  # will be overridden
-    "--weight-decay": 1e-4,   # will be overridden
-    "--temperature": 0.07,    # will be overridden
+    "--learning-rate": 3e-4,  # will be overridden
+    "--weight-decay": 1e-5,   # will be overridden
+    "--temperature": 0.05,    # will be overridden
     "--latent-dim": 256,
     "--hidden-channels": 256,
     "--final-hidden": 256,
@@ -46,10 +46,8 @@ BASE_ARGS = {
 # True grid (reduced + sensible)
 # -------------------------------
 GRID = {
-    "--task": ["read", "imagine"],
-    "--temperature": [0.05, 0.07, 0.10],
-    "--weight-decay": [1e-5, 1e-4, 5e-4],
-    "--learning-rate": [3e-4, 5e-4, 7e-4],
+    "--task": ["read"],
+    "--split-mode": ["unseen_sentence", "iid"]
 }
 
 # -------------------------------

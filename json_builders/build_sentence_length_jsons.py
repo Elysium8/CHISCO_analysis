@@ -4,8 +4,8 @@ import json
 import re
 
 # Paths (edit if needed)
-TEXTMAPS_PATH = "ds005170/json/textmaps.json"
-OUTPUT_PATH = "ds005170/json/sentence_length_chars.json"
+TEXTMAPS_PATH = "../ds005170/json/textmaps.json"
+OUTPUT_PATH = "../ds005170/json/sentence_length_chars.json"
 
 # Remove Chinese + English punctuation and whitespace
 PUNCT = re.compile(r"[，。！？、；：《》“”（）【】,.!?;:\"'()\s]+")
