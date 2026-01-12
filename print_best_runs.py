@@ -9,12 +9,18 @@ import shutil
 # GLOBAL TOGGLES (must BOTH be set to delete)
 # --------------------------------------------------
 DELETE_SUGGESTED = False
-DELETE_CONFIRM_TOKEN = ""  # must be exactly "YES_DELETE" to actually delete
+DELETE_CONFIRM_TOKEN = "YES_DELETE"  # must be exactly "YES_DELETE" to actually delete
 # --------------------------------------------------
 
 TASKS = ["read", "imagine"]
 SPLITS = ["iid", "unseen_sentence", "unseen_subject"]
-METRICS = ["top1", "top10", "top50"]
+
+# Per-K metrics we care about
+BASE_METRICS = ["top1", "top5", "top10", "top50"]
+# Balanced "total" metric
+BALANCED_METRIC = "avg"
+# Metrics to report "best model" for
+REPORT_METRICS = BASE_METRICS + [BALANCED_METRIC]
 
 CORE_FILES = ["config.json", "split.json", "best_checkpoint.pt"]
 
@@ -93,18 +99,27 @@ def fmt_metrics(mdict):
     def g(k):
         v = mdict.get(k, None)
         return "--" if v is None else f"{float(v):.2f}%"
-    return f"top1={g('top1')}, top10={g('top10')}, top50={g('top50')}"
+
+    parts = [f"{m}={g(m)}" for m in BASE_METRICS]
+    parts.append(f"{BALANCED_METRIC}={g(BALANCED_METRIC)}")
+    return ", ".join(parts)
+
+
+def compute_balanced_metric(mvec):
+    # Simple, balanced total: macro-average over the base K accuracies
+    vals = [float(mvec.get(k, 0.0)) for k in BASE_METRICS]
+    return sum(vals) / max(1, len(vals))
 
 
 def dominates(a_vec, b_vec):
     """
-    True if a_vec dominates b_vec:
-      a >= b for all metrics, and a > b for at least one metric.
+    True if a_vec dominates b_vec on BASE_METRICS:
+      a >= b for all base metrics, and a > b for at least one.
     Metrics are accuracies -> higher is better.
     """
     ge_all = True
     gt_any = False
-    for k in METRICS:
+    for k in BASE_METRICS:
         if a_vec[k] < b_vec[k]:
             ge_all = False
             break
@@ -133,12 +148,12 @@ def main():
     print(f"Found {len(run_dirs)} candidate run folders under: {args.experiments_root}\n")
 
     # Store per-run evaluated metrics
-    # runs[(task, split)] = list of {run_dir, metrics{top1,top10,top50}}
+    # runs[(task, split)] = list of {run_dir, metrics{top1,top5,top10,top50,avg}}
     runs = {(t, s): [] for t in TASKS for s in SPLITS}
 
     # best[task][split][metric] = (best_value, run_dir)
     best = {
-        task: {split: {m: (-1.0, None) for m in METRICS} for split in SPLITS}
+        task: {split: {m: (-1.0, None) for m in REPORT_METRICS} for split in SPLITS}
         for task in TASKS
     }
 
@@ -167,12 +182,14 @@ def main():
             continue
 
         # Ensure we have required metrics (default missing to 0.0 so comparisons still work)
-        mvec = {k: float(metrics.get(k, 0.0)) for k in METRICS}
+        mvec = {k: float(metrics.get(k, 0.0)) for k in BASE_METRICS}
+        mvec[BALANCED_METRIC] = compute_balanced_metric(mvec)
+
         runs[(task, split_mode)].append({"run_dir": run_dir, "metrics": mvec})
 
-        # Update winners for each metric independently
-        for m in METRICS:
-            val = float(metrics.get(m, 0.0))
+        # Update winners for each metric independently (including avg)
+        for m in REPORT_METRICS:
+            val = float(mvec.get(m, 0.0))
             cur_best, _ = best[task][split_mode][m]
             if val > cur_best:
                 best[task][split_mode][m] = (val, run_dir)
@@ -183,29 +200,32 @@ def main():
             print(f"  {task:7s} / {split:14s}: {counts[(task, split)]}")
     print()
 
-    # Print best per metric
+    # Print best per metric (incl avg)
     for task in TASKS:
         print("=" * 72)
         print(f"TASK: {task.upper()}")
         print("=" * 72)
         for split in SPLITS:
             print(f"\nSplit: {split.replace('_', ' ').title()}")
-            for m in METRICS:
+            for m in REPORT_METRICS:
                 val, run_dir = best[task][split][m]
-                label = f"Best {m.replace('top', 'top ').upper()}:"
+                if m == BALANCED_METRIC:
+                    label = "Best AVG:"
+                else:
+                    label = f"Best {m.replace('top', 'top ').upper()}:"
                 if run_dir is None:
                     print(f'  {label:<14} --')
                 else:
                     print(f'  {label:<14} "{os.path.basename(run_dir)}" ({val:.2f}%)')
         print()
 
-    # Suggest deletions (kept identical structure: still runs unconditionally under if True)
+    # Suggest deletions
     if True:
         print("\n" + "=" * 72)
         print("SUGGESTED MODEL FOLDERS TO DELETE (DOMINATED RUNS)")
         print("=" * 72)
         print("A run is suggested if it is DOMINATED BY ANOTHER ACTUAL RUN in the same (task,split) bucket,")
-        print("i.e., another run is >= on top1/top10/top50 and strictly better on at least one.\n")
+        print("i.e., another run is >= on top1/top5/top10/top50 and strictly better on at least one.\n")
 
         any_suggested = False
         to_delete = []
@@ -218,7 +238,6 @@ def main():
                     continue
 
                 dominated = []
-                # A run is dominated only if some other *actual run* dominates it.
                 for r in bucket_runs:
                     r_vec = r["metrics"]
                     is_dom = False
@@ -235,11 +254,21 @@ def main():
                     any_suggested = True
                     print(f"\nBucket: {task.upper()} / {split.replace('_',' ').title()}")
                     print("  Candidates to delete (dominated by some other run):")
-                    dominated.sort(key=lambda x: (x["metrics"]["top10"], x["metrics"]["top50"], x["metrics"]["top1"]))
+                    dominated.sort(
+                        key=lambda x: (
+                            x["metrics"]["top10"],
+                            x["metrics"]["top50"],
+                            x["metrics"]["top5"],
+                            x["metrics"]["top1"],
+                        )
+                    )
                     for r in dominated:
                         name = os.path.basename(r["run_dir"])
                         m = r["metrics"]
-                        print(f'    - "{name}"  (top1={m["top1"]:.2f}%, top10={m["top10"]:.2f}%, top50={m["top50"]:.2f}%)')
+                        print(
+                            f'    - "{name}"  (top1={m["top1"]:.2f}%, top5={m["top5"]:.2f}%, '
+                            f'top10={m["top10"]:.2f}%, top50={m["top50"]:.2f}%, avg={m["avg"]:.2f}%)'
+                        )
                         to_delete.append(r["run_dir"])
 
         if not any_suggested:

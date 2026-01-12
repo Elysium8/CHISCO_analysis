@@ -17,13 +17,13 @@ from copy import deepcopy
 import sys
 
 PYTHON = sys.executable
-TRAIN_SCRIPT = "updated_train_eeg_to_text_RAM.py"
+TRAIN_SCRIPT = "updated_train_eeg_to_text_embed.py"
 
 # -------------------------------
 # Fixed base configuration
 # -------------------------------
 BASE_ARGS = {
-    "--task": "read",                # FIXED context
+    "--task": "imagine",                # FIXED context
     "--split-mode": "unseen_sentence",  # FIXED context
     "--batch-size": 64,
     "--num-epochs": 30,
@@ -46,9 +46,11 @@ BASE_ARGS = {
 # True grid (reduced + sensible)
 # -------------------------------
 GRID = {
-    "--task": ["read"],
-    "--split-mode": ["unseen_sentence", "iid"]
+    "--batch-size": [64, 128],
+    "--learning-rate": [2e-4, 3e-4, 4e-4, 6e-4],
+    "--temperature": [0.03, 0.05, 0.07],
 }
+
 
 # -------------------------------
 # Helper
