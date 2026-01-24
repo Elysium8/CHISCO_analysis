@@ -9,7 +9,7 @@ import shutil
 # GLOBAL TOGGLES (must BOTH be set to delete)
 # --------------------------------------------------
 DELETE_SUGGESTED = False
-DELETE_CONFIRM_TOKEN = "YES_DELETE"  # must be exactly "YES_DELETE" to actually delete
+DELETE_CONFIRM_TOKEN = ""  # must be exactly "YES_DELETE" to actually delete
 # --------------------------------------------------
 
 TASKS = ["read", "imagine"]

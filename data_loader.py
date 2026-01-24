@@ -13,6 +13,23 @@ from torch.utils.data import Dataset
 # Low-level: robust run file loading (padding mismatch safe)
 # ============================================================
 
+def _trial_to_eeg_and_sentence(
+    trial: dict,
+    n_channels_keep: int = 122,
+    scale_to_microvolts: bool = True,
+) -> Tuple[torch.Tensor, str]:
+    arr = trial["input_features"]  # (1, 125, 1651)
+    eeg = arr[0, :n_channels_keep, :]
+    if scale_to_microvolts:
+        eeg = eeg * 1_000_000.0
+    eeg = np.asarray(eeg, dtype=np.float32)
+    eeg_t = torch.from_numpy(eeg)
+
+    sentence = (trial.get("text") or trial.get("sentence") or "").strip()
+    return eeg_t, sentence
+
+
+
 def _find_existing_path(candidates: Sequence[str]) -> Optional[str]:
     for p in candidates:
         if os.path.exists(p):
@@ -126,6 +143,63 @@ def load_subject_read_trials(
     return eeg_list, sentence_list, subject_ids
 
 
+from collections import defaultdict, deque
+
+def load_subject_combined_trials(
+    root: str,
+    sub_code: str,
+    subject_index: int,
+    n_runs: int = 45,
+    n_channels_keep: int = 122,
+    scale_to_microvolts: bool = True,
+) -> Tuple[List[torch.Tensor], List[str], List[int]]:
+    """
+    Returns combined trials where each sample is:
+      combined_eeg = concat(read_eeg, imagine_eeg, dim=-1)  # (C, Tread+Timagine)
+    Paired by sentence within the same subject (and per run).
+    """
+    eeg_list: List[torch.Tensor] = []
+    sentence_list: List[str] = []
+    subject_ids: List[int] = []
+
+    for run_idx in range(1, n_runs + 1):
+        read_trials = load_read_run(root, sub_code, run_idx)
+        imag_trials = load_imagine_run(root, sub_code, run_idx)
+
+        if len(read_trials) == 0 or len(imag_trials) == 0:
+            continue
+
+        # Build a sentence->queue mapping for imagine trials in this run
+        imag_map = defaultdict(deque)
+        for t in imag_trials:
+            eeg_i, sent_i = _trial_to_eeg_and_sentence(
+                t, n_channels_keep=n_channels_keep, scale_to_microvolts=scale_to_microvolts
+            )
+            if sent_i:
+                imag_map[sent_i].append(eeg_i)
+
+        # For each read trial, grab a matching imagine trial by sentence
+        for t in read_trials:
+            eeg_r, sent_r = _trial_to_eeg_and_sentence(
+                t, n_channels_keep=n_channels_keep, scale_to_microvolts=scale_to_microvolts
+            )
+            if not sent_r:
+                continue
+            if sent_r not in imag_map or len(imag_map[sent_r]) == 0:
+                continue
+
+            eeg_i = imag_map[sent_r].popleft()
+
+            # Concatenate time dimension: (C, T) -> (C, Tread+Timagine)
+            combined = torch.cat([eeg_r, eeg_i], dim=-1)
+
+            eeg_list.append(combined)
+            sentence_list.append(sent_r)
+            subject_ids.append(subject_index)
+
+    return eeg_list, sentence_list, subject_ids
+
+
 def load_chisco_imagine_all_subjects(
     root: str,
     subject_codes: Sequence[str],
@@ -177,6 +251,39 @@ def load_chisco_read_all_subjects(
     X = torch.stack(all_eeg, dim=0)
     subject_ids = torch.tensor(all_sub_ids, dtype=torch.long)
     return X, all_sentences, subject_ids
+
+
+def load_chisco_combined_all_subjects(
+    root: str,
+    subject_codes: Sequence[str],
+    n_runs: int = 45,
+    n_channels_keep: int = 122,
+    scale_to_microvolts: bool = True,
+) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
+    all_eeg: List[torch.Tensor] = []
+    all_sentences: List[str] = []
+    all_sub_ids: List[int] = []
+
+    for subj_idx, sub_code in enumerate(subject_codes):
+        eeg_list, sent_list, sub_ids = load_subject_combined_trials(
+            root=root,
+            sub_code=sub_code,
+            subject_index=subj_idx,
+            n_runs=n_runs,
+            n_channels_keep=n_channels_keep,
+            scale_to_microvolts=scale_to_microvolts,
+        )
+        all_eeg.extend(eeg_list)
+        all_sentences.extend(sent_list)
+        all_sub_ids.extend(sub_ids)
+
+    if len(all_eeg) == 0:
+        raise RuntimeError(f"No COMBINED trials found. root={root}, subjects={subject_codes}")
+
+    X = torch.stack(all_eeg, dim=0)  # (N, C, Tread+Timagine)
+    subject_ids = torch.tensor(all_sub_ids, dtype=torch.long)
+    return X, all_sentences, subject_ids
+
 
 
 class ChiscoImagineDataset(Dataset):

@@ -27,9 +27,11 @@ sys.path.append("./ds005170")
 
 from simple_experiment_logger import SimpleExperimentLogger
 from Brain_Module import BrainModule
+from CHISCO_baseline_model import CHISCOBaselineEEGEncoder
 from data_loader import (
     load_chisco_imagine_all_subjects,
     load_chisco_read_all_subjects,
+    load_chisco_combined_all_subjects,
     ChiscoImagineDataset,
 )
 from model_parts import EEGFrontEnd
@@ -62,6 +64,16 @@ def uppercase_config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
 
 # ----------------- Data prep -----------------
 
+def subsample_train_indices_global(train_idx, fraction, seed):
+    if fraction >= 1.0:
+        return train_idx
+    rng = random.Random(seed)
+    idx = list(train_idx)
+    rng.shuffle(idx)
+    k = max(1, int(len(idx) * fraction))
+    return idx[:k]
+
+
 def load_sentence_embeddings(path: str) -> Dict[str, List[float]]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -85,6 +97,8 @@ def build_eeg_text_embed_tensors(
         X, sentences, subj_ids = load_chisco_read_all_subjects(root=chisco_root, subject_codes=subject_codes)
     elif task == "imagine":
         X, sentences, subj_ids = load_chisco_imagine_all_subjects(root=chisco_root, subject_codes=subject_codes)
+    elif task == "combined":
+        X, sentences, subj_ids = load_chisco_combined_all_subjects(root=chisco_root, subject_codes=subject_codes)
     else:
         raise ValueError("task must be 'read' or 'imagine'")
 
@@ -386,6 +400,19 @@ class EEGToTextEmbedModel(nn.Module):
         e = self.proj(z)
         return nn.functional.normalize(e, dim=-1)
 
+class _CHISCOBaselineWrapper(nn.Module):
+    """
+    Keeps the same call signature as your current model:
+      forward(eeg, subject_ids) -> embedding
+    even though CHISCO baseline doesn't use subject_ids.
+    """
+    def __init__(self, encoder: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
 
 # ----------------- CLI -----------------
 
@@ -397,9 +424,10 @@ def build_argparser() -> argparse.ArgumentParser:
     # Paths / data
     p.add_argument("--chisco-root", type=str, default="./ds005170/derivatives/preprocessed_pkl")
     p.add_argument("--sent-emb-path", type=str, default="./ds005170/json/sentence_bert_embs.json")
-    p.add_argument("--task", type=str, default="imagine", choices=["read", "imagine"])
+    p.add_argument("--task", type=str, default="read", choices=["read", "imagine", "combined"])
     p.add_argument("--subject-codes", type=str, default="01,02,03,04,05",
                    help="Comma-separated subject codes, e.g. 01,02,03,04,05")
+    p.add_argument("--train-data-fraction", type=float, default=1.0)
 
     # Split
     p.add_argument("--split-mode", type=str, default="unseen_sentence",
@@ -412,13 +440,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--holdout-sent-fraction", type=float, default=0.2)
 
     # Training
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--num-epochs", type=int, default=50)
-    p.add_argument("--learning-rate", type=float, default=0.0003)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--num-epochs", type=int, default=30)
+    p.add_argument("--learning-rate", type=float, default=0.0002)
     p.add_argument("--weight-decay", type=float, default=1e-05)
     p.add_argument("--warmup-ratio", type=float, default=0.1)
     p.add_argument("--temperature", type=float, default=0.05)
-    p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--log-every-steps", type=int, default=50)
 
     # Dataset augmentation
@@ -430,7 +458,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # Model dims
     p.add_argument("--hidden-channels", type=int, default=256)
     p.add_argument("--final-hidden", type=int, default=256)
-        p.add_argument("--n-blocks", type=int, default=5)
+    p.add_argument("--n-blocks", type=int, default=5)
     p.add_argument("--latent-dim", type=int, default=256)
     p.add_argument("--pooling", type=str, default="mean", choices=["mean", "max"])
 
@@ -446,6 +474,22 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use-spatial-attn", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use-subject-layer", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use-residual-blocks", action=argparse.BooleanOptionalAction, default=True)
+
+    # Baseline stuff
+    p.add_argument("--arch", type=str, default="chisco_baseline",
+                   choices=["brainmodule", "chisco_baseline"])
+
+    p.add_argument("--baseline-layer", type=int, default=0)  # transformer layers (like CHISCO)
+    p.add_argument("--baseline-pooling", type=str, default="mean",
+                   choices=["mean", "sums", "tops"])
+
+    p.add_argument("--baseline-size1", type=int, default=8)
+    p.add_argument("--baseline-size2", type=int, default=8)
+    p.add_argument("--baseline-feel1", type=int, default=125)
+    p.add_argument("--baseline-feel2", type=int, default=25)
+    p.add_argument("--baseline-dropout1", type=float, default=0.1)
+    p.add_argument("--baseline-dropout2", type=float, default=0.1)
+    p.add_argument("--baseline-latent-dim", type=int, default=256)
 
     # Logging / output
     p.add_argument("--exp-root", type=str, default="experiments")
@@ -492,6 +536,15 @@ def main():
         holdout_subjects=holdout_subjects,
         holdout_sent_fraction=args.holdout_sent_fraction,
     )
+
+    train_idx = subsample_train_indices_global(
+        train_idx=train_idx,
+        fraction=args.train_data_fraction,
+        seed=args.seed,
+    )
+
+    split_info["train_data_fraction"] = float(args.train_data_fraction)
+    split_info["train_size_after_fraction"] = len(train_idx)
 
     # Logger path structure: <exp-root>/<experiment-name>/<task>/<split-mode>/<run_id>/
     task_name = os.path.join(args.experiment_name, args.task, split_info["split_mode"])
@@ -547,25 +600,48 @@ def main():
 
     # Model
     n_subjects = len(subject_codes)
-    model = EEGToTextEmbedModel(
-        n_channels=n_channels,
-        n_subjects=n_subjects,
-        text_dim=text_dim,
-        latent_dim=args.latent_dim,
-        hidden_channels=args.hidden_channels,
-        final_hidden=args.final_hidden,
-        n_blocks=args.n_blocks,
-        pooling=args.pooling,
-        # toggles
-        use_eegnet=args.use_eegnet,
-        eegnet_temporal_kern=args.eegnet_temporal_kern,
-        eegnet_F1=args.eegnet_f1,
-        eegnet_D=args.eegnet_d,
-        use_spatial_attn=args.use_spatial_attn,
-        use_subject_layer=args.use_subject_layer,
-        use_residual_blocks=args.use_residual_blocks,
-        raw_frontend_out_ch=args.raw_frontend_out_ch,
-    ).to(device)
+
+    if args.arch == "brainmodule":
+        model = EEGToTextEmbedModel(
+            n_channels=n_channels,
+            n_subjects=n_subjects,
+            text_dim=text_dim,
+            latent_dim=args.latent_dim,
+            hidden_channels=args.hidden_channels,
+            final_hidden=args.final_hidden,
+            n_blocks=args.n_blocks,
+            pooling=args.pooling,
+            # toggles
+            use_eegnet=args.use_eegnet,
+            eegnet_temporal_kern=args.eegnet_temporal_kern,
+            eegnet_F1=args.eegnet_f1,
+            eegnet_D=args.eegnet_d,
+            use_spatial_attn=args.use_spatial_attn,
+            use_subject_layer=args.use_subject_layer,
+            use_residual_blocks=args.use_residual_blocks,
+            raw_frontend_out_ch=args.raw_frontend_out_ch,
+        ).to(device)
+
+    elif args.arch == "chisco_baseline":
+        # Baseline ignores subject ids (kept in the training loop unchanged)
+        model = _CHISCOBaselineWrapper(
+            encoder=CHISCOBaselineEEGEncoder(
+                n_channels=n_channels,
+                text_dim=text_dim,
+                latent_dim=args.baseline_latent_dim,
+                dropout1=args.baseline_dropout1,
+                dropout2=args.baseline_dropout2,
+                feel1=args.baseline_feel1,
+                feel2=args.baseline_feel2,
+                size1=args.baseline_size1,
+                size2=args.baseline_size2,
+                layer=args.baseline_layer,
+                pooling=args.baseline_pooling,
+            )
+        ).to(device)
+
+    else:
+        raise ValueError(args.arch)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),

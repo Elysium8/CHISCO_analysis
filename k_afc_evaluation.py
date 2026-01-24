@@ -359,7 +359,7 @@ def main():
     ap.add_argument(
         "--top-k",
         type=int,
-        default=1,
+        default=10,
         help="Top-k accuracy (default: 1 = standard top-1).",
     )
 
