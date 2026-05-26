@@ -32,15 +32,28 @@ sys.path.append("./ds005170")
 # Reuse the same low-level loaders (so preprocessing stays consistent)
 from data_loader import load_read_run, load_imagine_run  # type: ignore
 
-# IMPORTANT:
-# Prefer importing the model class from the *same code version* used in training.
-try:
-    from updated_train_eeg_to_text_embed import EEGToTextEmbedModel  # if you use the CLI script
-except Exception:
-    from train_eeg_to_text_embed import EEGToTextEmbedModel
-
+from train_script_with_split import EEGToTextEmbedModel
 
 # -------------------- helpers --------------------
+
+def normalize_sentence(s):
+    return str(s).strip()
+
+def indices_from_sentence_split(sentences, split_sentences):
+    split_set = set(normalize_sentence(s) for s in split_sentences)
+    return [i for i, s in enumerate(sentences) if normalize_sentence(s) in split_set]
+
+def split_indices_from_splitinfo(split_info, sentences):
+    if "train_sentences" in split_info:
+        train_idx = indices_from_sentence_split(sentences, split_info["train_sentences"])
+        val_idx = indices_from_sentence_split(sentences, split_info["val_sentences"])
+        test_idx = indices_from_sentence_split(sentences, split_info["test_sentences"])
+        return train_idx, val_idx, test_idx
+
+    if "train_idx" in split_info and "val_idx" in split_info:
+        return split_info["train_idx"], split_info["val_idx"], split_info.get("test_idx", [])
+
+    raise KeyError("split.json must contain sentence splits or index splits.")
 
 def read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -72,37 +85,37 @@ def make_train_val_indices(n: int, val_split: float, shuffle: bool, seed: int) -
     return train_idx, val_idx
 
 
-def split_indices_from_splitinfo(
-        split_info: Dict[str, Any],
-        sentences: List[str],
-        subj_ids: torch.Tensor,
-        subject_codes: List[str],
-        seed: int,
-        val_split: float,
-        shuffle: bool,
-) -> Tuple[List[int], List[int]]:
-    """
-    Force the use of explicit indices saved in split.json.
-    Throws an error if they are missing to prevent split mismatch.
-    """
-    # Force usage of saved indices
-    if "train_idx" in split_info and "val_idx" in split_info:
-        train_idx = split_info["train_idx"]
-        val_idx = split_info["val_idx"]
-
-        # Basic sanity check
-        if not val_idx:
-            raise ValueError("The 'val_idx' list in split.json is empty.")
-
-        return train_idx, val_idx
-
-    # If the keys are missing, we throw a hard error instead of guessing the RNG
-    mode = split_info.get("split_mode", "unknown")
-    raise KeyError(
-        f"CRITICAL ERROR: 'train_idx' or 'val_idx' not found in split.json. "
-        f"Evaluation for mode '{mode}' cannot proceed safely because the "
-        f"original training indices are required to prevent data leakage or set mismatch."
-    )
+# def split_indices_from_splitinfo(
+#         split_info: Dict[str, Any],
+#         sentences: List[str],
+#         subj_ids: torch.Tensor,
+#         subject_codes: List[str],
+#         seed: int,
+#         val_split: float,
+#         shuffle: bool,
+# ) -> Tuple[List[int], List[int]]:
+#     """
+#     Force the use of explicit indices saved in split.json.
+#     Throws an error if they are missing to prevent split mismatch.
+#     """
+#     # Force usage of saved indices
+#     if "train_idx" in split_info and "val_idx" in split_info:
+#         train_idx = split_info["train_idx"]
+#         val_idx = split_info["val_idx"]
+#
+#         # Basic sanity check
+#         if not val_idx:
+#             raise ValueError("The 'val_idx' list in split.json is empty.")
+#
+#         return train_idx, val_idx
+#
+#     # If the keys are missing, we throw a hard error instead of guessing the RNG
+#     mode = split_info.get("split_mode", "unknown")
+#     raise KeyError(
+#         f"CRITICAL ERROR: 'train_idx' or 'val_idx' not found in split.json. "
+#         f"Evaluation for mode '{mode}' cannot proceed safely because the "
+#         f"original training indices are required to prevent data leakage or set mismatch."
+#     )
 
 
 # def split_indices_from_splitinfo(
@@ -400,14 +413,19 @@ def main():
     n_subjects = len(subject_codes)
 
     # 2) Recreate exact split (same code path, just using our sentences/subj_ids lists)
-    train_idx, val_idx = split_indices_from_splitinfo(
+    # train_idx, val_idx = split_indices_from_splitinfo(
+    #     split_info=split_info,
+    #     sentences=sentences,
+    #     subj_ids=subj_ids,
+    #     subject_codes=subject_codes,
+    #     seed=seed,
+    #     val_split=val_split,
+    #     shuffle=shuffle,
+    # )
+
+    train_idx, val_idx, test_idx = split_indices_from_splitinfo(
         split_info=split_info,
         sentences=sentences,
-        subj_ids=subj_ids,
-        subject_codes=subject_codes,
-        seed=seed,
-        val_split=val_split,
-        shuffle=shuffle,
     )
 
     task_str = task.upper()
@@ -455,6 +473,8 @@ def main():
         final_hidden=final_hidden,
         n_blocks=n_blocks,
         pooling=pooling,
+        use_frontend=True,
+        use_brainmodule=True,
         use_eegnet=use_eegnet,
         eegnet_temporal_kern=eegnet_temporal_kern,
         eegnet_F1=eegnet_f1,
@@ -470,7 +490,7 @@ def main():
 
     # 5) Streaming val dataset + eval (THIS is the memory fix)
     base_ds = ChiscoStreamingEvalDataset(root=chisco_root, trial_index=trial_index)
-    val_ds = Subset(base_ds, val_idx)
+    val_ds = Subset(base_ds, test_idx)
 
     print("\nRunning global retrieval evaluation (streaming, low-RAM)...")
     results = evaluate_global_retrieval_streaming(

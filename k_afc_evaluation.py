@@ -7,7 +7,9 @@
 # Predict the candidate with highest cosine similarity to EEG embedding.
 #
 # MODIFICATION (minimal):
-#   - Added --top-k argument (default=1) to compute Top-k accuracy instead of Top-1.
+#   - Support evaluating multiple top-k values in a single run (default: 5, 10, 50)
+#   - Save one curve per top-k with an appropriate chance line (chance = min(top_k, K) / K).
+#   - NEW: also save a matching "relative accuracy" curve (accuracy / chance) per top-k.
 #
 # This script is based ENTIRELY on the same working logic as your binary
 # discrimination script (choose_one_testing.py):
@@ -17,14 +19,15 @@
 #   - model construction from checkpoint/config args
 #
 # Outputs:
-#   - k_afc_results.json (per K, per seed, mean, CI)
-#   - k_afc_curve.png (accuracy vs K with chance line)
+#   - k_afc_results.json (per top-k, per K, per seed, mean, CI)
+#   - k_afc_curve_top5.png / top10 / top50 (accuracy vs K with chance line)
+#   - k_afc_curve_top5_relative.png / top10_relative / top50_relative (accuracy/chance vs K)
 #
 # Usage:
 #   python k_afc_evaluation.py --exp-dir <run_dir>
 #   python k_afc_evaluation.py --exp-dir <run_dir> --n-seeds 3
 #   python k_afc_evaluation.py --exp-dir <run_dir> --Ks 2 5 10 25 50 100 500 1000
-#   python k_afc_evaluation.py --exp-dir <run_dir> --top-k 10
+#   python k_afc_evaluation.py --exp-dir <run_dir> --topks 5 10 50
 #
 import os
 import sys
@@ -43,14 +46,20 @@ import matplotlib.pyplot as plt
 sys.path.append("./ds005170")
 from data_loader import load_read_run, load_imagine_run  # type: ignore
 
-# Same model import pattern
-try:
-    from updated_train_eeg_to_text_embed import EEGToTextEmbedModel
-except Exception:
-    from train_eeg_to_text_embed import EEGToTextEmbedModel
+from train_script_with_split import EEGToTextEmbedModel
 
 
 # -------------------- helpers (same as working script) --------------------
+
+def normalize_sentence(s):
+    return str(s).strip()
+
+def indices_from_sentence_split(sentences, split_sentences):
+    split_set = set(normalize_sentence(s) for s in split_sentences)
+    return [
+        i for i, s in enumerate(sentences)
+        if normalize_sentence(s) in split_set
+    ]
 
 def read_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -312,12 +321,14 @@ def evaluate_k_afc(
             total += 1
 
     acc = (correct / total * 100.0) if total > 0 else 0.0
+    # Chance for top-k in K-AFC is k/K (capped when top_k > K)
+    chance_topk = (min(int(top_k), int(K)) / float(K) * 100.0) if K > 0 else 0.0
     return {
         "acc": float(acc),
         "correct": float(correct),
         "total": float(total),
         "skipped_missing_label": float(skipped_missing_label),
-        "chance": float(100.0 / K),  # NOTE: this remains top-1 chance; interpret accordingly for top-k
+        "chance": float(chance_topk),
     }
 
 
@@ -344,7 +355,7 @@ def main():
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--eval-batch-size", type=int, default=32)
 
-    ap.add_argument("--n-seeds", type=int, default=3, help="Default 3 to keep runtime reasonable.")
+    ap.add_argument("--n-seeds", type=int, default=1, help="Default 3 to keep runtime reasonable.")
     ap.add_argument("--seed-start", type=int, default=123)
 
     ap.add_argument(
@@ -355,12 +366,20 @@ def main():
         help="Candidate sizes K. Default: 2 5 10 25 50 100 500 1000 FULLVOCAB",
     )
 
-    # NEW: top-k accuracy control
+    # Top-k accuracy controls
+    ap.add_argument(
+        "--topks",
+        type=int,
+        nargs="+",
+        default=[5, 10, 50],
+        help="Compute top-k accuracy for each k in this list (default: 5 10 50).",
+    )
+    # Back-compat: allow a single --top-k to override --topks
     ap.add_argument(
         "--top-k",
         type=int,
-        default=10,
-        help="Top-k accuracy (default: 1 = standard top-1).",
+        default=None,
+        help="(Deprecated) Single top-k value. If provided, overrides --topks.",
     )
 
     args = ap.parse_args()
@@ -412,16 +431,11 @@ def main():
     print(f"Index built: {len(trial_index)} trials", flush=True)
 
     # 2) Reconstruct split (same)
-    _, val_idx = split_indices_from_splitinfo(
-        split_info=split_info,
-        sentences=sentences,
-        subj_ids=subj_ids,
-        subject_codes=subject_codes,
-        seed=seed_split,
-        val_split=val_split,
-        shuffle=shuffle,
+    val_idx = indices_from_sentence_split(
+        sentences,
+        split_info["test_sentences"],
     )
-    print(f"Val trials: {len(val_idx)}", flush=True)
+    print(f"Test trials: {len(val_idx)}", flush=True)
 
     # 3) Load sentence embeddings from JSON (same)
     sent2emb = load_sentence_embeddings(sent_emb_path)
@@ -445,7 +459,15 @@ def main():
     eval_seeds = list(range(int(args.seed_start), int(args.seed_start) + int(args.n_seeds)))
     print(f"Ks        : {Ks}", flush=True)
     print(f"Eval seeds: {eval_seeds}", flush=True)
-    print(f"Top-k     : {int(args.top_k)}", flush=True)
+    topks = [int(k) for k in (args.topks or [])]
+    if args.top_k is not None:
+        topks = [int(args.top_k)]
+    # sanitize
+    topks = sorted(set([k for k in topks if k >= 1]))
+    if len(topks) == 0:
+        topks = [1]
+
+    print(f"Top-k(s)  : {topks}", flush=True)
 
     # 4) Load model from checkpoint/config (same explicit-args approach as working script)
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -482,6 +504,8 @@ def main():
         final_hidden=final_hidden,
         n_blocks=n_blocks,
         pooling=pooling,
+        use_frontend=True,
+        use_brainmodule=True,
         use_eegnet=use_eegnet,
         eegnet_temporal_kern=eegnet_temporal_kern,
         eegnet_F1=eegnet_f1,
@@ -492,7 +516,7 @@ def main():
         raw_frontend_out_ch=raw_frontend_out_ch,
     ).to(device)
 
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
 
     # 5) Build val dataset (same)
@@ -508,50 +532,53 @@ def main():
         "vocab_size": vocab_size,
         "Ks": Ks,
         "eval_seeds": eval_seeds,
-        "top_k": int(args.top_k),  # NEW: record in results
-        "per_K": {},
+        "topks": topks,
+        "per_topk": {},
     }
 
     print("\nRunning K-AFC...", flush=True)
-    for K in Ks:
-        per_seed = []
-        per_seed_correct = []
-        total_scored = None
-        chance = 100.0 / K  # NOTE: still top-1 chance baseline
+    for top_k in topks:
+        results["per_topk"][str(top_k)] = {"per_K": {}}
 
-        for s in eval_seeds:
-            r = evaluate_k_afc(
-                model=model,
-                dataset=val_ds,
-                text_matrix=text_matrix,
-                sentence_to_id=sentence_to_id,
-                device=device,
-                K=K,
-                seed=s,
-                batch_size=args.eval_batch_size,
-                top_k=args.top_k,  # NEW
+        for K in Ks:
+            per_seed = []
+            per_seed_correct = []
+            total_scored = None
+            chance = (min(int(top_k), int(K)) / float(K) * 100.0) if K > 0 else 0.0
+
+            for s in eval_seeds:
+                r = evaluate_k_afc(
+                    model=model,
+                    dataset=val_ds,
+                    text_matrix=text_matrix,
+                    sentence_to_id=sentence_to_id,
+                    device=device,
+                    K=K,
+                    seed=s,
+                    batch_size=args.eval_batch_size,
+                    top_k=top_k,
+                )
+                per_seed.append(r["acc"])
+                per_seed_correct.append(r["correct"])
+                total_scored = r["total"]  # should be constant
+
+            mean, pm = _mean_ci95(per_seed)
+            mean_correct = float(np.mean(per_seed_correct)) if len(per_seed_correct) else 0.0
+
+            results["per_topk"][str(top_k)]["per_K"][str(K)] = {
+                "acc_per_seed": per_seed,
+                "mean_acc": mean,
+                "ci95_pm": pm,
+                "chance": chance,
+                "mean_correct": mean_correct,
+                "total_scored": total_scored,
+            }
+
+            print(
+                f"top-{int(top_k):2d} | K={K:5d} | acc={mean:6.2f} ± {pm:5.2f}% | "
+                f"chance={chance:6.2f}% | avg correct={mean_correct:.1f}/{int(total_scored)}",
+                flush=True,
             )
-            per_seed.append(r["acc"])
-            per_seed_correct.append(r["correct"])
-            total_scored = r["total"]  # should be constant
-
-        mean, pm = _mean_ci95(per_seed)
-        mean_correct = float(np.mean(per_seed_correct)) if len(per_seed_correct) else 0.0
-
-        results["per_K"][str(K)] = {
-            "acc_per_seed": per_seed,
-            "mean_acc": mean,
-            "ci95_pm": pm,
-            "chance": chance,
-            "mean_correct": mean_correct,
-            "total_scored": total_scored,
-        }
-
-        print(
-            f"K={K:5d} | top-{int(args.top_k)} acc={mean:6.2f} ± {pm:5.2f}% | "
-            f"chance(top-1)={chance:6.2f}% | avg correct={mean_correct:.1f}/{int(total_scored)}",
-            flush=True,
-        )
 
     # Save JSON
     out_json = os.path.join(exp_dir, "k_afc_results.json")
@@ -559,45 +586,56 @@ def main():
         json.dump(results, f, indent=2)
     print(f"\nSaved: {out_json}", flush=True)
 
-    # 7) Plot
-    Ks_arr = np.array([int(k) for k in results["per_K"].keys()], dtype=np.int64)
-    Ks_arr.sort()
+    # 7) Plot (one curve per top-k)
+    for top_k in topks:
+        perK = results["per_topk"][str(top_k)]["per_K"]
+        Ks_arr = np.array([int(k) for k in perK.keys()], dtype=np.int64)
+        Ks_arr.sort()
 
-    means = np.array([results["per_K"][str(int(k))]["mean_acc"] for k in Ks_arr], dtype=np.float32)
-    cis = np.array([results["per_K"][str(int(k))]["ci95_pm"] for k in Ks_arr], dtype=np.float32)
-    chances = np.array([results["per_K"][str(int(k))]["chance"] for k in Ks_arr], dtype=np.float32)
+        means = np.array([perK[str(int(k))]["mean_acc"] for k in Ks_arr], dtype=np.float32)
+        cis = np.array([perK[str(int(k))]["ci95_pm"] for k in Ks_arr], dtype=np.float32)
+        chances = np.array([perK[str(int(k))]["chance"] for k in Ks_arr], dtype=np.float32)
 
-    plt.figure(figsize=(7.2, 5.0))
-    plt.semilogx(Ks_arr, means, marker="o", label="Model")
-    plt.fill_between(Ks_arr, means - cis, means + cis, alpha=0.2, label="95% CI (over seeds)")
-    plt.semilogx(Ks_arr, chances, linestyle="--", label="Chance (1/K)")
+        plt.figure(figsize=(7.2, 5.0))
+        plt.semilogx(Ks_arr, means, marker="o", label="Model")
+        plt.fill_between(Ks_arr, means - cis, means + cis, alpha=0.2, label="95% CI (over seeds)")
+        plt.semilogx(Ks_arr, chances, linestyle="--", label=f"Chance (min({top_k},K)/K)")
 
-    plt.xlabel("Candidate set size (K)")
-    plt.ylabel(f"Top-{int(args.top_k)} accuracy (%)")
-    plt.title(f"K-AFC EEG→Text Top-{int(args.top_k)} performance vs candidate vocabulary size")
-    plt.grid(True, which="both", linestyle="--", alpha=0.4)
-    plt.legend()
+        plt.xlabel("Candidate set size (K)")
+        plt.ylabel(f"Top-{int(top_k)} accuracy (%)")
+        plt.title(f"K-AFC EEG→Text Top-{int(top_k)} performance vs candidate set size")
+        plt.grid(True, which="both", linestyle="--", alpha=0.4)
+        plt.legend()
 
-    out_png = os.path.join(exp_dir, "k_afc_curve.png")
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=200)
-    print(f"Saved: {out_png}", flush=True)
+        out_png = os.path.join(exp_dir, f"k_afc_curve_top{int(top_k)}.png")
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200)
+        plt.close()
+        print(f"Saved: {out_png}", flush=True)
 
-    acc_over_chance = means / chances
+        # --- NEW: relative accuracy plot (accuracy / chance) ---
+        eps = 1e-12
+        denom = np.maximum(chances, eps)  # avoid divide-by-zero
+        rel_means = means / denom
+        rel_low = (means - cis) / denom
+        rel_high = (means + cis) / denom
 
-    plt.figure(figsize=(7.2, 5.0))
-    plt.semilogx(Ks_arr, acc_over_chance, marker="o")
+        plt.figure(figsize=(7.2, 5.0))
+        plt.semilogx(Ks_arr, rel_means, marker="o", label="Model / Chance")
+        plt.fill_between(Ks_arr, rel_low, rel_high, alpha=0.2, label="95% CI (over seeds)")
 
-    plt.xlabel("Candidate set size (K)")
-    plt.ylabel("Accuracy ÷ Chance")
-    plt.title(f"K-AFC EEG→Text Top-{int(args.top_k)} performance relative to chance (top-1 baseline)")
-    plt.grid(True, which="both", linestyle="--", alpha=0.4)
+        plt.axhline(1.0, linestyle="--", label="Chance = 1.0")
+        plt.xlabel("Candidate set size (K)")
+        plt.ylabel(f"Top-{int(top_k)} relative accuracy (× chance)")
+        plt.title(f"K-AFC EEG→Text Top-{int(top_k)} relative performance vs candidate set size")
+        plt.grid(True, which="both", linestyle="--", alpha=0.4)
+        plt.legend()
 
-    out_png_ratio = os.path.join(exp_dir, "k_afc_curve_over_chance.png")
-    plt.tight_layout()
-    plt.savefig(out_png_ratio, dpi=200)
-    plt.close()
-    print(f"Saved: {out_png_ratio}", flush=True)
+        out_png_rel = os.path.join(exp_dir, f"k_afc_curve_top{int(top_k)}_relative.png")
+        plt.tight_layout()
+        plt.savefig(out_png_rel, dpi=200)
+        plt.close()
+        print(f"Saved: {out_png_rel}", flush=True)
 
 
 if __name__ == "__main__":

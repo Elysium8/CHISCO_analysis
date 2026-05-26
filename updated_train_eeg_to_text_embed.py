@@ -323,7 +323,7 @@ def train_one_epoch(
 
 class EEGToTextEmbedModel(nn.Module):
     """
-    EEG frontend (optional) -> BrainModule -> pooling -> projection -> L2 normalize
+    Optional frontend -> optional BrainModule -> always-on prediction head.
     """
     def __init__(
         self,
@@ -335,60 +335,78 @@ class EEGToTextEmbedModel(nn.Module):
         final_hidden: int,
         n_blocks: int,
         pooling: str,
-        # toggles
+        # stage toggles
+        use_frontend: bool,
+        use_brainmodule: bool,
+        # frontend toggles
         use_eegnet: bool,
         eegnet_temporal_kern: int,
         eegnet_F1: int,
         eegnet_D: int,
+        raw_frontend_out_ch: int,
         # brainmodule toggles
         use_spatial_attn: bool,
         use_subject_layer: bool,
         use_residual_blocks: bool,
-        # simple fallback frontend if not using EEGNet
-        raw_frontend_out_ch: int,
     ):
         super().__init__()
         self.pooling = pooling
+        self.use_frontend = use_frontend
+        self.use_brainmodule = use_brainmodule
 
-        if use_eegnet:
-            self.eeg_frontend = EEGFrontEnd(
-                in_ch=n_channels,
-                temporal_kern=eegnet_temporal_kern,
-                F1=eegnet_F1,
-                D=eegnet_D,
-            )
-            frontend_out_ch = eegnet_F1 * eegnet_D
+        # 1) Frontend (optional)
+        if self.use_frontend:
+            if use_eegnet:
+                self.eeg_frontend = EEGFrontEnd(
+                    in_ch=n_channels,
+                    temporal_kern=eegnet_temporal_kern,
+                    F1=eegnet_F1,
+                    D=eegnet_D,
+                )
+                frontend_out_ch = eegnet_F1 * eegnet_D
+            else:
+                # Simple alternative: 1x1 conv to map raw channels to a chosen feature width
+                self.eeg_frontend = nn.Conv1d(n_channels, raw_frontend_out_ch, kernel_size=1)
+                frontend_out_ch = raw_frontend_out_ch
         else:
-            # Simple alternative: 1x1 conv to map raw channels to a chosen feature width
-            self.eeg_frontend = nn.Conv1d(n_channels, raw_frontend_out_ch, kernel_size=1)
-            frontend_out_ch = raw_frontend_out_ch
+            self.eeg_frontend = nn.Identity()
+            frontend_out_ch = n_channels
 
-        self.brain = BrainModule(
-            in_channels=frontend_out_ch,
-            out_channels=latent_dim,
-            n_subjects=n_subjects,
-            hidden_channels=hidden_channels,
-            final_hidden=final_hidden,
-            n_blocks=n_blocks,
-            spatial_out_channels=frontend_out_ch,
-            # toggles
-            use_spatial_attn=use_spatial_attn,
-            use_subject_layer=use_subject_layer,
-            use_residual_blocks=use_residual_blocks,
-        )
+        # 2) BrainModule (optional)
+        if self.use_brainmodule:
+            self.brain = BrainModule(
+                in_channels=frontend_out_ch,
+                out_channels=latent_dim,
+                n_subjects=n_subjects,
+                hidden_channels=hidden_channels,
+                final_hidden=final_hidden,
+                n_blocks=n_blocks,
+                spatial_out_channels=frontend_out_ch,
+                use_spatial_attn=use_spatial_attn,
+                use_subject_layer=use_subject_layer,
+                use_residual_blocks=use_residual_blocks,
+            )
+            self.sensor_pos = nn.Parameter(torch.randn(frontend_out_ch, 2) * 0.1)
+            pred_in_dim = latent_dim
+        else:
+            self.brain = None
+            self.sensor_pos = None
+            pred_in_dim = frontend_out_ch
 
-        # sensor positions are only meaningful if spatial attention is enabled
-        self.sensor_pos = nn.Parameter(torch.randn(frontend_out_ch, 2) * 0.1)
-
+        # 3) Prediction head (always on)
         self.proj = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim),
+            nn.Linear(pred_in_dim, pred_in_dim),
             nn.ReLU(),
-            nn.Linear(latent_dim, text_dim),
+            nn.Linear(pred_in_dim, text_dim),
         )
 
     def forward(self, x: torch.Tensor, subject_ids: torch.Tensor) -> torch.Tensor:
         x = self.eeg_frontend(x)  # (B, C', T')
-        z = self.brain(x, self.sensor_pos, subject_ids)  # (B, latent_dim, T')
+
+        if self.brain is not None:
+            z = self.brain(x, self.sensor_pos, subject_ids)  # (B, latent_dim, T')
+        else:
+            z = x  # bypass BrainModule entirely
 
         if self.pooling == "mean":
             z = z.mean(dim=-1)
@@ -424,7 +442,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # Paths / data
     p.add_argument("--chisco-root", type=str, default="./ds005170/derivatives/preprocessed_pkl")
     p.add_argument("--sent-emb-path", type=str, default="./ds005170/json/sentence_bert_embs.json")
-    p.add_argument("--task", type=str, default="read", choices=["read", "imagine", "combined"])
+    p.add_argument("--task", type=str, default="imagine", choices=["read", "imagine", "combined"])
     p.add_argument("--subject-codes", type=str, default="01,02,03,04,05",
                    help="Comma-separated subject codes, e.g. 01,02,03,04,05")
     p.add_argument("--train-data-fraction", type=float, default=1.0)
@@ -441,7 +459,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Training
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--num-epochs", type=int, default=30)
+    p.add_argument("--num-epochs", type=int, default=50)
     p.add_argument("--learning-rate", type=float, default=0.0002)
     p.add_argument("--weight-decay", type=float, default=1e-05)
     p.add_argument("--warmup-ratio", type=float, default=0.1)
@@ -463,8 +481,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--pooling", type=str, default="mean", choices=["mean", "max"])
 
     # Toggle model parts
+    p.add_argument("--use-frontend", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable stage 1 frontend. If false, raw EEG goes directly to the BrainModule or prediction head.")
+    p.add_argument("--use-brainmodule", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable stage 2 BrainModule. If false, frontend/raw features go directly to the prediction head.")
     p.add_argument("--use-eegnet", action=argparse.BooleanOptionalAction, default=True,
-                   help="Use EEGNet-style frontend (EEGFrontEnd). If false, uses a simple 1x1 conv.")
+                   help="If stage 1 frontend is enabled, use EEGNet-style frontend. If false, uses a simple 1x1 conv.")
     p.add_argument("--eegnet-temporal-kern", type=int, default=64)
     p.add_argument("--eegnet-f1", type=int, default=16)
     p.add_argument("--eegnet-d", type=int, default=2)
@@ -476,7 +498,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--use-residual-blocks", action=argparse.BooleanOptionalAction, default=True)
 
     # Baseline stuff
-    p.add_argument("--arch", type=str, default="chisco_baseline",
+    p.add_argument("--arch", type=str, default="brainmodule",
                    choices=["brainmodule", "chisco_baseline"])
 
     p.add_argument("--baseline-layer", type=int, default=0)  # transformer layers (like CHISCO)
@@ -602,6 +624,11 @@ def main():
     n_subjects = len(subject_codes)
 
     if args.arch == "brainmodule":
+        if (not args.use_brainmodule) and (
+            args.use_spatial_attn or args.use_subject_layer or args.use_residual_blocks
+        ):
+            print("Warning: BrainModule is disabled, so --use-spatial-attn/--use-subject-layer/--use-residual-blocks are ignored.")
+
         model = EEGToTextEmbedModel(
             n_channels=n_channels,
             n_subjects=n_subjects,
@@ -611,15 +638,16 @@ def main():
             final_hidden=args.final_hidden,
             n_blocks=args.n_blocks,
             pooling=args.pooling,
-            # toggles
+            use_frontend=args.use_frontend,
+            use_brainmodule=args.use_brainmodule,
             use_eegnet=args.use_eegnet,
             eegnet_temporal_kern=args.eegnet_temporal_kern,
             eegnet_F1=args.eegnet_f1,
             eegnet_D=args.eegnet_d,
+            raw_frontend_out_ch=args.raw_frontend_out_ch,
             use_spatial_attn=args.use_spatial_attn,
             use_subject_layer=args.use_subject_layer,
             use_residual_blocks=args.use_residual_blocks,
-            raw_frontend_out_ch=args.raw_frontend_out_ch,
         ).to(device)
 
     elif args.arch == "chisco_baseline":

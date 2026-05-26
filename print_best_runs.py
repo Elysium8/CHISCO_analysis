@@ -13,7 +13,7 @@ DELETE_CONFIRM_TOKEN = ""  # must be exactly "YES_DELETE" to actually delete
 # --------------------------------------------------
 
 TASKS = ["read", "imagine"]
-SPLITS = ["iid", "unseen_sentence", "unseen_subject"]
+SPLITS = ["iid", "unseen_sentence", "unseen_subject", "sentence_aligned_read_imagine"]
 
 # Per-K metrics we care about
 BASE_METRICS = ["top1", "top5", "top10", "top50"]
@@ -132,7 +132,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Find best experiment folders per task/split using eval_global_retrieval.py, and suggest deletions."
     )
-    ap.add_argument("--experiments-root", type=str, default="experiments")
+    ap.add_argument("--experiments-root", type=str, default="Proper_split_results")
     ap.add_argument("--eval-script", type=str, default="eval_global_retrieval.py")
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--eval-batch-size", type=int, default=32)
