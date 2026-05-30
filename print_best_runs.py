@@ -95,6 +95,44 @@ def run_global_eval(eval_script: str, run_dir: str, device: str, eval_batch_size
     subprocess.run(cmd, check=True)
 
 
+
+
+def has_trial_level_results(run_dir: str) -> bool:
+    """
+    Returns True if a run already has trial-level global retrieval output.
+
+    Preferred new format:
+      - global_retrieval_trials.json: a list of per-trial rows
+
+    Also accepts a transitional/legacy format where trial_rows were saved inside
+    global_retrieval.json.
+    """
+    trial_json = os.path.join(run_dir, "global_retrieval_trials.json")
+    if os.path.exists(trial_json):
+        try:
+            rows = load_json(trial_json)
+            if not isinstance(rows, list) or len(rows) == 0:
+                return False
+            required = {"top1_correct", "top5_correct", "top10_correct", "top50_correct"}
+            return required.issubset(set(rows[0].keys()))
+        except Exception:
+            return False
+
+    aggregate_json = os.path.join(run_dir, "global_retrieval.json")
+    if os.path.exists(aggregate_json):
+        try:
+            metrics = load_json(aggregate_json)
+            rows = metrics.get("trial_rows", None)
+            if not isinstance(rows, list) or len(rows) == 0:
+                return False
+            required = {"top1_correct", "top5_correct", "top10_correct", "top50_correct"}
+            return required.issubset(set(rows[0].keys()))
+        except Exception:
+            return False
+
+    return False
+
+
 def fmt_metrics(mdict):
     def g(k):
         v = mdict.get(k, None)
@@ -130,13 +168,23 @@ def dominates(a_vec, b_vec):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Find best experiment folders per task/split using eval_global_retrieval.py, and suggest deletions."
+        description="Find best experiment folders per task/split using eval_global_retrieval.py, and suggest deletions. Recomputes runs that lack trial-level global retrieval output."
     )
     ap.add_argument("--experiments-root", type=str, default="Proper_split_results")
-    ap.add_argument("--eval-script", type=str, default="eval_global_retrieval.py")
+    ap.add_argument("--eval-script", type=str, default="eval_global_retrieval_trial_level.py")
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--eval-batch-size", type=int, default=32)
     ap.add_argument("--recompute", action="store_true")
+    ap.add_argument(
+        "--require-trial-level",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If true, recompute runs whose aggregate global_retrieval.json exists "
+            "but trial-level output is missing or invalid. Use --no-require-trial-level "
+            "to keep the old aggregate-only behavior."
+        ),
+    )
     ap.add_argument(
         "--suggest-deletions",
         action="store_true",
@@ -167,12 +215,35 @@ def main():
         counts[(task, split_mode)] += 1
 
         out_json = os.path.join(run_dir, "global_retrieval.json")
-        if args.recompute or (not os.path.exists(out_json)):
+        needs_eval = False
+        eval_reasons = []
+
+        if args.recompute:
+            needs_eval = True
+            eval_reasons.append("--recompute")
+
+        if not os.path.exists(out_json):
+            needs_eval = True
+            eval_reasons.append("missing global_retrieval.json")
+
+        if args.require_trial_level and not has_trial_level_results(run_dir):
+            needs_eval = True
+            eval_reasons.append("missing/invalid trial-level retrieval output")
+
+        if needs_eval:
             try:
-                print(f"[EVAL] {task}/{split_mode} -> {os.path.basename(run_dir)}")
+                reason_str = "; ".join(eval_reasons)
+                print(f"[EVAL] {task}/{split_mode} -> {os.path.basename(run_dir)} ({reason_str})")
                 run_global_eval(args.eval_script, run_dir, args.device, args.eval_batch_size)
             except subprocess.CalledProcessError:
                 print(f"  !! Eval failed for {run_dir}. Skipping.")
+                continue
+
+            if args.require_trial_level and not has_trial_level_results(run_dir):
+                print(
+                    "  !! Eval finished, but trial-level output was still not found. "
+                    "Make sure --eval-script points to the trial-level evaluator. Skipping."
+                )
                 continue
 
         try:

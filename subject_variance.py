@@ -347,6 +347,174 @@ def safe_silhouette(X: np.ndarray, labels: np.ndarray) -> float:
         return float("nan")
 
 
+def finite_mean(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    return float(np.mean(x)) if x.size else float("nan")
+
+
+def percentile_ci(samples: list[float], ci: float = 0.95) -> dict:
+    """Return percentile confidence interval from bootstrap samples."""
+    vals = np.asarray(samples, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return {"level": ci, "low": float("nan"), "high": float("nan"), "n_bootstrap_valid": 0}
+    alpha = (1.0 - ci) / 2.0
+    return {
+        "level": ci,
+        "low": float(np.quantile(vals, alpha)),
+        "high": float(np.quantile(vals, 1.0 - alpha)),
+        "n_bootstrap_valid": int(vals.size),
+    }
+
+
+def metric_with_ci(value: float, samples: list[float], ci: float = 0.95) -> dict:
+    """Compact JSON-friendly point estimate + CI object."""
+    out = {"estimate": float(value)}
+    out.update(percentile_ci(samples, ci=ci))
+    return out
+
+
+def avg_between_for_centroids(centroids: list[np.ndarray | None], subject_indices: np.ndarray | None = None) -> float:
+    """Mean pairwise centroid distance for selected subjects."""
+    if subject_indices is None:
+        subject_indices = np.arange(len(centroids))
+    vals = []
+    idx = [int(i) for i in subject_indices if centroids[int(i)] is not None]
+    if len(idx) < 2:
+        return float("nan")
+    for a, b in combinations(idx, 2):
+        vals.append(float(np.linalg.norm(centroids[a] - centroids[b])))
+    return finite_mean(np.asarray(vals, dtype=np.float64))
+
+
+def leave_one_subject_out_distances(centroids: list[np.ndarray | None]) -> dict:
+    """
+    For each subject, compute its mean centroid distance to all other present subjects.
+    The summary value is the mean of those per-subject leave-one-subject-out distances.
+    """
+    out = {}
+    for s, c in enumerate(centroids):
+        if c is None:
+            out[s] = float("nan")
+            continue
+        vals = [float(np.linalg.norm(c - other)) for j, other in enumerate(centroids) if j != s and other is not None]
+        out[s] = finite_mean(np.asarray(vals, dtype=np.float64))
+    vals = np.asarray([out[s] for s in sorted(out)], dtype=np.float64)
+    return {"by_subject_index": out, "mean": finite_mean(vals)}
+
+
+def bootstrap_subject_level_metrics(
+    centroids: list[np.ndarray | None],
+    within_by_subject: dict,
+    n_bootstrap: int,
+    seed: int,
+) -> dict:
+    """
+    Bootstrap subject-level metrics by resampling subjects with replacement.
+    This gives uncertainty across subjects rather than across individual segments.
+    """
+    rng = np.random.default_rng(seed)
+    present = np.array([i for i, c in enumerate(centroids) if c is not None and np.isfinite(within_by_subject.get(i, np.nan))], dtype=int)
+    if present.size < 2 or n_bootstrap <= 0:
+        return {
+            "avg_between_subject_centroid_distance": [],
+            "within_subject_dispersion_mean": [],
+            "between_over_within_ratio": [],
+            "leave_one_subject_out_distance_mean": [],
+        }
+
+    samples_between = []
+    samples_within = []
+    samples_ratio = []
+    samples_loso = []
+
+    for _ in range(n_bootstrap):
+        draw = rng.choice(present, size=present.size, replace=True)
+
+        # Between: because subjects can repeat in a bootstrap draw, compute pairwise
+        # distances over the drawn list positions, excluding self-pairs with identical positions.
+        pair_vals = []
+        for i in range(draw.size):
+            for j in range(i + 1, draw.size):
+                a, b = int(draw[i]), int(draw[j])
+                if a == b:
+                    pair_vals.append(0.0)
+                else:
+                    pair_vals.append(float(np.linalg.norm(centroids[a] - centroids[b])))
+        between = finite_mean(np.asarray(pair_vals, dtype=np.float64))
+        within = finite_mean(np.asarray([within_by_subject[int(s)] for s in draw], dtype=np.float64))
+        ratio = float(between / within) if np.isfinite(between) and np.isfinite(within) and within > 0 else float("nan")
+
+        # Leave-one-subject-out distance: for each drawn subject position, compare it
+        # with the other drawn positions, then average those leave-one-out values.
+        loso_vals = []
+        for i in range(draw.size):
+            s = int(draw[i])
+            other_vals = []
+            for j in range(draw.size):
+                if i == j:
+                    continue
+                t = int(draw[j])
+                if s == t:
+                    other_vals.append(0.0)
+                else:
+                    other_vals.append(float(np.linalg.norm(centroids[s] - centroids[t])))
+            loso_vals.append(finite_mean(np.asarray(other_vals, dtype=np.float64)))
+        loso = finite_mean(np.asarray(loso_vals, dtype=np.float64))
+
+        samples_between.append(between)
+        samples_within.append(within)
+        samples_ratio.append(ratio)
+        samples_loso.append(loso)
+
+    return {
+        "avg_between_subject_centroid_distance": samples_between,
+        "within_subject_dispersion_mean": samples_within,
+        "between_over_within_ratio": samples_ratio,
+        "leave_one_subject_out_distance_mean": samples_loso,
+    }
+
+
+def bootstrap_silhouette_score(
+    X: np.ndarray,
+    labels: np.ndarray,
+    n_bootstrap: int,
+    seed: int,
+    max_points: int = 5000,
+) -> list[float]:
+    """
+    Stratified bootstrap over sampled points for silhouette uncertainty.
+    Keeps each subject represented by resampling within each subject.
+    """
+    if n_bootstrap <= 0:
+        return []
+
+    labels = labels.astype(int, copy=False)
+    uniq = np.unique(labels)
+    if uniq.size < 2:
+        return []
+
+    rng = np.random.default_rng(seed)
+    by_subject = {s: np.where(labels == s)[0] for s in uniq}
+    if any(idx.size < 2 for idx in by_subject.values()):
+        return []
+
+    samples = []
+    for _ in range(n_bootstrap):
+        boot_idx = []
+        for s, idx in by_subject.items():
+            boot_idx.append(rng.choice(idx, size=idx.size, replace=True))
+        boot_idx = np.concatenate(boot_idx)
+
+        # Silhouette is O(n^2); subsample very large bootstrap draws deterministically.
+        if boot_idx.size > max_points:
+            boot_idx = rng.choice(boot_idx, size=max_points, replace=False)
+
+        samples.append(safe_silhouette(X[boot_idx], labels[boot_idx]))
+    return samples
+
+
 def save_matrix_csv(M: np.ndarray, outpath: str, subject_codes: list[str]):
     header = ",".join([""] + [f"subj_{i}_{code}" for i, code in enumerate(subject_codes)])
     with open(outpath, "w", encoding="utf-8") as f:
@@ -369,6 +537,10 @@ def compute_mode_report(
     XD: np.ndarray,
     sidD: np.ndarray,
     pca: IncrementalPCA,
+    n_bootstrap: int = 1000,
+    ci_level: float = 0.95,
+    ci_seed: int = 0,
+    max_silhouette_ci_points: int = 5000,
 ):
     M = centroid_distance_matrix(subj_means)
     avg_between = avg_between_subject_distance_from_matrix(M)
@@ -395,6 +567,21 @@ def compute_mode_report(
     sil_2d = safe_silhouette(xy, sid)
     sil_D = safe_silhouette(XD, sidD)
 
+    loso = leave_one_subject_out_distances(centroids)
+
+    subject_boot = bootstrap_subject_level_metrics(
+        centroids=centroids,
+        within_by_subject=within,
+        n_bootstrap=n_bootstrap,
+        seed=ci_seed,
+    )
+    sil_2d_boot = bootstrap_silhouette_score(
+        xy, sid, n_bootstrap=n_bootstrap, seed=ci_seed + 101, max_points=max_silhouette_ci_points
+    )
+    sil_D_boot = bootstrap_silhouette_score(
+        XD, sidD, n_bootstrap=n_bootstrap, seed=ci_seed + 202, max_points=max_silhouette_ci_points
+    )
+
     evr = getattr(pca, "explained_variance_ratio_", None)
     evr_list = evr.tolist() if evr is not None else []
 
@@ -402,13 +589,36 @@ def compute_mode_report(
         "mode": mode_name,
         "n_subjects": len(subject_codes),
         "subjects": [{"subject_index": i, "subject_code": subject_codes[i]} for i in range(len(subject_codes))],
+        "confidence_interval_method": {
+            "level": ci_level,
+            "n_bootstrap_requested": n_bootstrap,
+            "subject_level_metrics": "bootstrap over subjects with replacement",
+            "silhouette_metrics": "stratified bootstrap over sampled points within each subject",
+            "max_silhouette_ci_points": max_silhouette_ci_points,
+        },
         "avg_between_subject_centroid_distance": avg_between,
+        "avg_between_subject_centroid_distance_ci95": metric_with_ci(
+            avg_between, subject_boot["avg_between_subject_centroid_distance"], ci=ci_level
+        ),
         "within_subject_dispersion_mean": within_mean,
+        "within_subject_dispersion_mean_ci95": metric_with_ci(
+            within_mean, subject_boot["within_subject_dispersion_mean"], ci=ci_level
+        ),
         "within_subject_dispersion_std": within_std,
         "between_over_within_ratio": bw_ratio,
+        "between_over_within_ratio_ci95": metric_with_ci(
+            bw_ratio, subject_boot["between_over_within_ratio"], ci=ci_level
+        ),
         "within_subject_dispersion_by_subject_index": within,
+        "leave_one_subject_out_distance_mean": loso["mean"],
+        "leave_one_subject_out_distance_mean_ci95": metric_with_ci(
+            loso["mean"], subject_boot["leave_one_subject_out_distance_mean"], ci=ci_level
+        ),
+        "leave_one_subject_out_distance_by_subject_index": loso["by_subject_index"],
         "silhouette_score_2d_pca": sil_2d,
+        "silhouette_score_2d_pca_ci95": metric_with_ci(sil_2d, sil_2d_boot, ci=ci_level),
         "silhouette_score_full_embedding_sample": sil_D,
+        "silhouette_score_full_embedding_sample_ci95": metric_with_ci(sil_D, sil_D_boot, ci=ci_level),
         "pca_explained_variance_ratio": evr_list,
         "pca_explained_variance_ratio_pc1": evr_list[0] if len(evr_list) > 0 else None,
         "pca_explained_variance_ratio_pc2": evr_list[1] if len(evr_list) > 1 else None,
@@ -450,6 +660,12 @@ def main():
     ap.add_argument("--max-plot-points-per-subject", type=int, default=2000)
     ap.add_argument("--max-fulld-per-subject", type=int, default=800)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--n-bootstrap", type=int, default=1000,
+                    help="Number of bootstrap resamples for confidence intervals. Use 0 to disable CIs.")
+    ap.add_argument("--ci-level", type=float, default=0.95,
+                    help="Confidence interval level for bootstrap percentile CIs.")
+    ap.add_argument("--max-silhouette-ci-points", type=int, default=5000,
+                    help="Maximum points per bootstrap draw for silhouette CIs to avoid O(n^2) blowups.")
 
     # FIX 1 args
     ap.add_argument("--t-common", type=int, default=1651,
@@ -521,11 +737,19 @@ def main():
     # Reports
     report_read, M_read = compute_mode_report(
         "READ", subject_codes, subj_means_by_mode["READ"],
-        xy_read, sid_read, XD_read, sidD_read, ipca
+        xy_read, sid_read, XD_read, sidD_read, ipca,
+        n_bootstrap=args.n_bootstrap,
+        ci_level=args.ci_level,
+        ci_seed=args.seed + 3000,
+        max_silhouette_ci_points=args.max_silhouette_ci_points,
     )
     report_imag, M_imag = compute_mode_report(
         "IMAGINE", subject_codes, subj_means_by_mode["IMAGINE"],
-        xy_imag, sid_imag, XD_imag, sidD_imag, ipca
+        xy_imag, sid_imag, XD_imag, sidD_imag, ipca,
+        n_bootstrap=args.n_bootstrap,
+        ci_level=args.ci_level,
+        ci_seed=args.seed + 4000,
+        max_silhouette_ci_points=args.max_silhouette_ci_points,
     )
 
     # Save plots
@@ -562,23 +786,44 @@ def main():
         "t_common": T_common,
         "window_mode": args.window_mode,
         "shrinkage": shrinkage,
+        "confidence_interval_method": {
+            "level": args.ci_level,
+            "n_bootstrap_requested": args.n_bootstrap,
+            "subject_level_metrics": "bootstrap over subjects with replacement",
+            "silhouette_metrics": "stratified bootstrap over sampled points within each subject",
+            "max_silhouette_ci_points": args.max_silhouette_ci_points,
+        },
         "pca_explained_variance_ratio": getattr(ipca, "explained_variance_ratio_", None).tolist()
         if getattr(ipca, "explained_variance_ratio_", None) is not None else [],
         "READ": {
             "avg_between_subject_centroid_distance": report_read["avg_between_subject_centroid_distance"],
+            "avg_between_subject_centroid_distance_ci95": report_read["avg_between_subject_centroid_distance_ci95"],
             "within_subject_dispersion_mean": report_read["within_subject_dispersion_mean"],
+            "within_subject_dispersion_mean_ci95": report_read["within_subject_dispersion_mean_ci95"],
             "within_subject_dispersion_std": report_read["within_subject_dispersion_std"],
             "between_over_within_ratio": report_read["between_over_within_ratio"],
+            "between_over_within_ratio_ci95": report_read["between_over_within_ratio_ci95"],
             "silhouette_score_2d_pca": report_read["silhouette_score_2d_pca"],
+            "silhouette_score_2d_pca_ci95": report_read["silhouette_score_2d_pca_ci95"],
             "silhouette_score_full_embedding_sample": report_read["silhouette_score_full_embedding_sample"],
+            "silhouette_score_full_embedding_sample_ci95": report_read["silhouette_score_full_embedding_sample_ci95"],
+            "leave_one_subject_out_distance_mean": report_read["leave_one_subject_out_distance_mean"],
+            "leave_one_subject_out_distance_mean_ci95": report_read["leave_one_subject_out_distance_mean_ci95"],
         },
         "IMAGINE": {
             "avg_between_subject_centroid_distance": report_imag["avg_between_subject_centroid_distance"],
+            "avg_between_subject_centroid_distance_ci95": report_imag["avg_between_subject_centroid_distance_ci95"],
             "within_subject_dispersion_mean": report_imag["within_subject_dispersion_mean"],
+            "within_subject_dispersion_mean_ci95": report_imag["within_subject_dispersion_mean_ci95"],
             "within_subject_dispersion_std": report_imag["within_subject_dispersion_std"],
             "between_over_within_ratio": report_imag["between_over_within_ratio"],
+            "between_over_within_ratio_ci95": report_imag["between_over_within_ratio_ci95"],
             "silhouette_score_2d_pca": report_imag["silhouette_score_2d_pca"],
+            "silhouette_score_2d_pca_ci95": report_imag["silhouette_score_2d_pca_ci95"],
             "silhouette_score_full_embedding_sample": report_imag["silhouette_score_full_embedding_sample"],
+            "silhouette_score_full_embedding_sample_ci95": report_imag["silhouette_score_full_embedding_sample_ci95"],
+            "leave_one_subject_out_distance_mean": report_imag["leave_one_subject_out_distance_mean"],
+            "leave_one_subject_out_distance_mean_ci95": report_imag["leave_one_subject_out_distance_mean_ci95"],
         },
     }
     with open(os.path.join(args.outdir, "summary.json"), "w", encoding="utf-8") as f:
@@ -586,10 +831,21 @@ def main():
     print("Saved:", os.path.join(args.outdir, "summary.json"))
 
     print("\n=== Quick summary ===")
-    print(f"READ    avg between-subject centroid distance: {summary['READ']['avg_between_subject_centroid_distance']:.4f}")
-    print(f"IMAGINE avg between-subject centroid distance: {summary['IMAGINE']['avg_between_subject_centroid_distance']:.4f}")
-    print(f"READ    silhouette (2D PCA): {summary['READ']['silhouette_score_2d_pca']:.4f}")
-    print(f"IMAGINE silhouette (2D PCA): {summary['IMAGINE']['silhouette_score_2d_pca']:.4f}")
+    def _fmt_ci(metric):
+        return f"{metric['estimate']:.4f} [{metric['low']:.4f}, {metric['high']:.4f}]"
+
+    print(f"READ    avg between-subject centroid distance: {_fmt_ci(summary['READ']['avg_between_subject_centroid_distance_ci95'])}")
+    print(f"IMAGINE avg between-subject centroid distance: {_fmt_ci(summary['IMAGINE']['avg_between_subject_centroid_distance_ci95'])}")
+    print(f"READ    within-subject dispersion: {_fmt_ci(summary['READ']['within_subject_dispersion_mean_ci95'])}")
+    print(f"IMAGINE within-subject dispersion: {_fmt_ci(summary['IMAGINE']['within_subject_dispersion_mean_ci95'])}")
+    print(f"READ    between/within ratio: {_fmt_ci(summary['READ']['between_over_within_ratio_ci95'])}")
+    print(f"IMAGINE between/within ratio: {_fmt_ci(summary['IMAGINE']['between_over_within_ratio_ci95'])}")
+    print(f"READ    silhouette (2D PCA): {_fmt_ci(summary['READ']['silhouette_score_2d_pca_ci95'])}")
+    print(f"IMAGINE silhouette (2D PCA): {_fmt_ci(summary['IMAGINE']['silhouette_score_2d_pca_ci95'])}")
+    print(f"READ    silhouette (full embedding): {_fmt_ci(summary['READ']['silhouette_score_full_embedding_sample_ci95'])}")
+    print(f"IMAGINE silhouette (full embedding): {_fmt_ci(summary['IMAGINE']['silhouette_score_full_embedding_sample_ci95'])}")
+    print(f"READ    leave-one-subject-out distance: {_fmt_ci(summary['READ']['leave_one_subject_out_distance_mean_ci95'])}")
+    print(f"IMAGINE leave-one-subject-out distance: {_fmt_ci(summary['IMAGINE']['leave_one_subject_out_distance_mean_ci95'])}")
 
 
 if __name__ == "__main__":

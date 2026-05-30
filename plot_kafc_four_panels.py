@@ -30,8 +30,8 @@ def plot_task_curves(agg, out_dir, task_label):
         plt.fill_between(Ks, means - cis, means + cis, alpha=0.18)
 
 
-    plt.xlabel("Candidate set size (K)")
-    plt.ylabel("Accuracy (%)")
+    plt.xlabel("Candidate set size (K)", fontsize=14)
+    plt.ylabel("Accuracy (%)", fontsize=14)
     plt.grid(True, which="both", linestyle="--", alpha=0.4)
     plt.legend()
     plt.tight_layout()
@@ -57,8 +57,8 @@ def plot_task_curves(agg, out_dir, task_label):
 
     plt.axhline(1.0, linestyle="--", label="Chance")
 
-    plt.xlabel("Candidate set size (K)")
-    plt.ylabel("Relative accuracy (× chance)")
+    plt.xlabel("Candidate set size (K)", fontsize=14)
+    plt.ylabel("Relative accuracy (× chance)", fontsize=14)
     plt.grid(True, which="both", linestyle="--", alpha=0.4)
     plt.legend()
     plt.tight_layout()

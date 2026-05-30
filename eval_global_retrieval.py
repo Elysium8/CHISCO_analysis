@@ -32,7 +32,8 @@ sys.path.append("./ds005170")
 # Reuse the same low-level loaders (so preprocessing stays consistent)
 from data_loader import load_read_run, load_imagine_run  # type: ignore
 
-from train_script_with_split import EEGToTextEmbedModel
+from train_script_with_split import EEGToTextEmbedModel, _CHISCOBaselineWrapper
+from CHISCO_baseline_model import CHISCOBaselineEEGEncoder
 
 # -------------------- helpers --------------------
 
@@ -232,6 +233,10 @@ class ChiscoStreamingEvalDataset(Dataset):
             "eeg": eeg,
             "subject_id": torch.tensor(ref.subject_index, dtype=torch.long),
             "sentence": ref.sentence,
+            # Stable trial identifiers for paired model comparisons.
+            "sub_code": ref.sub_code,
+            "run_idx": int(ref.run_idx),
+            "trial_in_run": int(ref.trial_in_run),
         }
 
 def build_streaming_index(
@@ -286,6 +291,15 @@ def build_streaming_index(
     return trial_index, sentences, subj_ids_t
 
 
+
+
+def _batch_value(batch, key: str, i: int):
+    """Return a JSON-serializable scalar/list item from a DataLoader-collated batch."""
+    value = batch[key]
+    if torch.is_tensor(value):
+        return value[i].item()
+    return value[i]
+
 # -------------------- eval --------------------
 
 @torch.no_grad()
@@ -310,6 +324,7 @@ def evaluate_global_retrieval_streaming(
     ks = [1, 5, 10, 50]
     top_counts = {k: 0 for k in ks}
     total = 0
+    trial_rows: List[Dict[str, Any]] = []
 
     for batch in loader:
         eeg = batch["eeg"].to(device)
@@ -324,21 +339,66 @@ def evaluate_global_retrieval_streaming(
         _, indices = sim.topk(k=k_use, dim=1)
 
         for i, sent in enumerate(batch_sentences):
+            trial_number = total
             total += 1
+            sent = str(sent).strip()
             true_id = sentence_to_id.get(sent, None)
+
+            # Stable identifiers for pairing this trial across model runs.
+            sub_code = str(_batch_value(batch, "sub_code", i))
+            run_idx = int(_batch_value(batch, "run_idx", i))
+            trial_in_run = int(_batch_value(batch, "trial_in_run", i))
+            stable_trial_id = f"{sub_code}_run{run_idx:02d}_trial{trial_in_run:04d}"
+
             if true_id is None:
-                # keep identical behavior to original: count in total, but skip scoring
+                # Keep identical aggregate behavior to original: count in total, but skip scoring.
+                trial_rows.append({
+                    "trial_number": int(trial_number),
+                    "trial_id": stable_trial_id,
+                    "sub_code": sub_code,
+                    "run_idx": run_idx,
+                    "trial_in_run": trial_in_run,
+                    "sentence": sent,
+                    "true_id": None,
+                    "rank_within_top50": None,
+                    "top1_correct": 0,
+                    "top5_correct": 0,
+                    "top10_correct": 0,
+                    "top50_correct": 0,
+                })
                 continue
 
             cand = indices[i].tolist()
-            if true_id == cand[0]:
+            top1_correct = int(true_id == cand[0])
+            top5_correct = int(true_id in cand[:5])
+            top10_correct = int(true_id in cand[:10])
+            top50_correct = int(true_id in cand[:50])
+
+            if top1_correct:
                 top_counts[1] += 1
-            if true_id in cand[:5]:
+            if top5_correct:
                 top_counts[5] += 1
-            if true_id in cand[:10]:
+            if top10_correct:
                 top_counts[10] += 1
-            if true_id in cand[:50]:
+            if top50_correct:
                 top_counts[50] += 1
+
+            rank = cand.index(true_id) + 1 if true_id in cand else None
+
+            trial_rows.append({
+                "trial_number": int(trial_number),
+                "trial_id": stable_trial_id,
+                "sub_code": sub_code,
+                "run_idx": run_idx,
+                "trial_in_run": trial_in_run,
+                "sentence": sent,
+                "true_id": int(true_id),
+                "rank_within_top50": rank,
+                "top1_correct": top1_correct,
+                "top5_correct": top5_correct,
+                "top10_correct": top10_correct,
+                "top50_correct": top50_correct,
+            })
 
     return {
         "top1": top_counts[1] / total * 100.0,
@@ -346,6 +406,7 @@ def evaluate_global_retrieval_streaming(
         "top10": top_counts[10] / total * 100.0,
         "top50": top_counts[50] / total * 100.0,
         "total": float(total),
+        "trial_rows": trial_rows,
     }
 
 
@@ -464,26 +525,55 @@ def main():
     use_subject_layer = bool(_get("use_subject_layer", True))
     use_residual_blocks = bool(_get("use_residual_blocks", True))
 
-    model = EEGToTextEmbedModel(
-        n_channels=n_channels,
-        n_subjects=n_subjects,
-        text_dim=text_dim,
-        latent_dim=latent_dim,
-        hidden_channels=hidden_channels,
-        final_hidden=final_hidden,
-        n_blocks=n_blocks,
-        pooling=pooling,
-        use_frontend=True,
-        use_brainmodule=True,
-        use_eegnet=use_eegnet,
-        eegnet_temporal_kern=eegnet_temporal_kern,
-        eegnet_F1=eegnet_f1,
-        eegnet_D=eegnet_d,
-        use_spatial_attn=use_spatial_attn,
-        use_subject_layer=use_subject_layer,
-        use_residual_blocks=use_residual_blocks,
-        raw_frontend_out_ch=raw_frontend_out_ch,
-    ).to(device)
+    arch = str(_get("arch", "brainmodule")).lower()
+
+    if arch == "chisco_baseline":
+        baseline_layer = int(_get("baseline_layer", 0))
+        baseline_pooling = _get("baseline_pooling", "mean")
+        baseline_size1 = int(_get("baseline_size1", 8))
+        baseline_size2 = int(_get("baseline_size2", 8))
+        baseline_feel1 = int(_get("baseline_feel1", 125))
+        baseline_feel2 = int(_get("baseline_feel2", 25))
+        baseline_dropout1 = float(_get("baseline_dropout1", 0.1))
+        baseline_dropout2 = float(_get("baseline_dropout2", 0.1))
+        baseline_latent_dim = int(_get("baseline_latent_dim", 256))
+
+        model = _CHISCOBaselineWrapper(
+            encoder=CHISCOBaselineEEGEncoder(
+                n_channels=n_channels,
+                text_dim=text_dim,
+                latent_dim=baseline_latent_dim,
+                dropout1=baseline_dropout1,
+                dropout2=baseline_dropout2,
+                feel1=baseline_feel1,
+                feel2=baseline_feel2,
+                size1=baseline_size1,
+                size2=baseline_size2,
+                layer=baseline_layer,
+                pooling=baseline_pooling,
+            )
+        ).to(device)
+    else:
+        model = EEGToTextEmbedModel(
+            n_channels=n_channels,
+            n_subjects=n_subjects,
+            text_dim=text_dim,
+            latent_dim=latent_dim,
+            hidden_channels=hidden_channels,
+            final_hidden=final_hidden,
+            n_blocks=n_blocks,
+            pooling=pooling,
+            use_frontend=True,
+            use_brainmodule=True,
+            use_eegnet=use_eegnet,
+            eegnet_temporal_kern=eegnet_temporal_kern,
+            eegnet_F1=eegnet_f1,
+            eegnet_D=eegnet_d,
+            use_spatial_attn=use_spatial_attn,
+            use_subject_layer=use_subject_layer,
+            use_residual_blocks=use_residual_blocks,
+            raw_frontend_out_ch=raw_frontend_out_ch,
+        ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     model.eval()
@@ -502,9 +592,15 @@ def main():
         batch_size=args.eval_batch_size,
     )
 
+    trial_rows = results.pop("trial_rows")
+
     out_path = os.path.join(exp_dir, "global_retrieval.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
+
+    trial_out_path = os.path.join(exp_dir, "global_retrieval_trials.json")
+    with open(trial_out_path, "w", encoding="utf-8") as f:
+        json.dump(trial_rows, f, indent=2, ensure_ascii=False)
 
     print("\n=== Global Retrieval Accuracy ===")
     print(f"Top-1  : {results['top1']:.2f}%")
@@ -512,7 +608,8 @@ def main():
     print(f"Top-10 : {results['top10']:.2f}%")
     print(f"Top-50 : {results['top50']:.2f}%")
     print(f"(Out of {int(results['total'])} validation trials)")
-    print(f"Saved: {out_path}")
+    print(f"Saved summary: {out_path}")
+    print(f"Saved trial-level correctness: {trial_out_path}")
 
 if __name__ == "__main__":
     main()
