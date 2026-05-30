@@ -369,7 +369,7 @@ python plot_data_scaling.py
 
 ---
 
-# Data Augmentation Ablations
+# Data Augmentation
 
 Supported augmentations:
 
@@ -396,18 +396,6 @@ Disable all augmentation:
 ```bash
 --no-augment-train
 ```
-
-Summarise multi-seed augmentation studies:
-
-```bash
-python summarize_augmentation_results.py augmentation_results/
-```
-
-which reports:
-
-- Mean retrieval performance
-- 95% confidence intervals
-- Read vs Recall comparisons
 
 ---
 
