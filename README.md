@@ -477,16 +477,6 @@ python GRADCAM.py \
 
 ---
 
-# Citation
-
-If you use this repository, please cite:
-
-```bibtex
-@article{zhang2024chisco,
-  title={CHISCO: Open-Vocabulary EEG-to-Text Decoding},
-  author={Zhang et al.},
-  year={2024}
-}
 ```
 
 In addition, please cite the original CHISCO dataset paper.
