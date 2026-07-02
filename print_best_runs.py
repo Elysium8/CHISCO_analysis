@@ -171,7 +171,7 @@ def main():
         description="Find best experiment folders per task/split using eval_global_retrieval.py, and suggest deletions. Recomputes runs that lack trial-level global retrieval output."
     )
     ap.add_argument("--experiments-root", type=str, default="Proper_split_results")
-    ap.add_argument("--eval-script", type=str, default="eval_global_retrieval_trial_level.py")
+    ap.add_argument("--eval-script", type=str, default="eval_global_retrieval.py")
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--eval-batch-size", type=int, default=32)
     ap.add_argument("--recompute", action="store_true")

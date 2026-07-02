@@ -1,12 +1,8 @@
 # train_eeg_to_text_embed_cli.py
 #
-# CLI version of train_eeg_to_text_embed.py:
-# - argparse for ALL config/hyperparams
-# - toggles for model parts: EEGNet frontend, spatial attention, subject layer, residual blocks
-# - experiment logging via SimpleExperimentLogger (config.json, split.json, metrics.jsonl, best/last checkpoints)
-# - plots saved inside experiment run folder
-#
-# Based on the user's current training script. :contentReference[oaicite:2]{index=2}
+# CLI training script for EEG-to-text embedding experiments.
+# Handles dataset loading, sentence-based splits, model setup, logging,
+# checkpointing, and simple training plots.
 
 import os
 import sys
@@ -14,7 +10,7 @@ import math
 import json
 import random
 import argparse
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import torch
@@ -22,7 +18,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 
-# Ensure we can import ds005170 modules
+# Local CHISCO / ds005170 imports
 sys.path.append("./ds005170")
 
 from simple_experiment_logger import SimpleExperimentLogger
@@ -37,12 +33,13 @@ from data_loader import (
 from model_parts import EEGFrontEnd
 
 
-# ----------------- Utils -----------------
+# ----------------- General helpers -----------------
 
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
     try:
         import numpy as np
         np.random.seed(seed)
@@ -51,25 +48,26 @@ def set_seed(seed: int):
 
 
 def uppercase_config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
-    """
-    Build a JSON-serializable config dict for logging.
-    """
+    """Turn argparse values into a JSON-friendly config dictionary."""
     d = vars(args).copy()
-    # Make sure everything is JSON-friendly
+
     for k, v in list(d.items()):
         if isinstance(v, torch.device):
             d[k] = str(v)
+
     return d
 
 
-# ----------------- Data prep -----------------
+# ----------------- Data preparation -----------------
 
 def subsample_train_indices_global(train_idx, fraction, seed):
     if fraction >= 1.0:
         return train_idx
+
     rng = random.Random(seed)
     idx = list(train_idx)
     rng.shuffle(idx)
+
     k = max(1, int(len(idx) * fraction))
     return idx[:k]
 
@@ -86,19 +84,31 @@ def build_eeg_text_embed_tensors(
     subject_codes: List[str],
 ) -> Tuple[torch.Tensor, List[str], torch.Tensor, torch.Tensor]:
     """
+    Load EEG trials and pair each trial with its sentence embedding.
+
     Returns:
-        X_kept:        (N, C, T) float32 tensor
-        sentences_kept:list[str] length N
-        subj_ids_kept: (N,) long tensor
-        text_targets:  (N, D) float32 tensor
+        X_kept:         EEG tensor, shape (N, C, T)
+        sentences_kept: sentence strings for the retained trials
+        subj_ids_kept:  subject IDs, shape (N,)
+        text_targets:   sentence embedding targets, shape (N, D)
     """
     print(f"Loading CHISCO {task} EEG + sentences...")
+
     if task == "read":
-        X, sentences, subj_ids = load_chisco_read_all_subjects(root=chisco_root, subject_codes=subject_codes)
+        X, sentences, subj_ids = load_chisco_read_all_subjects(
+            root=chisco_root,
+            subject_codes=subject_codes,
+        )
     elif task == "imagine":
-        X, sentences, subj_ids = load_chisco_imagine_all_subjects(root=chisco_root, subject_codes=subject_codes)
+        X, sentences, subj_ids = load_chisco_imagine_all_subjects(
+            root=chisco_root,
+            subject_codes=subject_codes,
+        )
     elif task == "combined":
-        X, sentences, subj_ids = load_chisco_combined_all_subjects(root=chisco_root, subject_codes=subject_codes)
+        X, sentences, subj_ids = load_chisco_combined_all_subjects(
+            root=chisco_root,
+            subject_codes=subject_codes,
+        )
     else:
         raise ValueError("task must be 'read' or 'imagine'")
 
@@ -116,6 +126,7 @@ def build_eeg_text_embed_tensors(
         if emb is None:
             missing += 1
             continue
+
         keep_indices.append(i)
         targets.append(torch.tensor(emb, dtype=torch.float32))
 
@@ -129,6 +140,7 @@ def build_eeg_text_embed_tensors(
 
     print(f"Using {len(keep_indices)} trials with valid text embeddings.")
     print(f"text_dim = {text_targets.shape[1]}")
+
     return X_kept, sentences_kept, subj_ids_kept, text_targets
 
 
@@ -148,14 +160,23 @@ def indices_from_sentence_split(sentences, split_sentences):
 
     return idx
 
-def make_train_val_indices(n_samples: int, val_split: float, shuffle: bool, seed: int) -> Tuple[List[int], List[int]]:
+
+def make_train_val_indices(
+    n_samples: int,
+    val_split: float,
+    shuffle: bool,
+    seed: int,
+) -> Tuple[List[int], List[int]]:
     idx = list(range(n_samples))
+
     if shuffle:
         rnd = random.Random(seed)
         rnd.shuffle(idx)
+
     val_size = int(n_samples * val_split)
     val_idx = idx[:val_size]
     train_idx = idx[val_size:]
+
     return train_idx, val_idx
 
 
@@ -171,24 +192,25 @@ def make_split_indices(
     holdout_sent_fraction: float,
 ) -> Tuple[List[int], List[int], Dict[str, Any]]:
     """
-    Returns: train_idx, val_idx, split_info
+    Create train/validation indices for the requested split mode.
 
-    Functionality is identical to the original version; the only change is that
-    we also store the explicit train/val indices inside split_info for exact reproducibility.
+    This also stores the explicit indices in split_info, which makes later
+    evaluation easier to reproduce exactly.
     """
     n = len(sentences)
 
     if split_mode == "iid":
         train_idx, val_idx = make_train_val_indices(n, val_split, shuffle, seed)
+
         split_info = {
             "split_mode": "iid",
             "val_split": float(val_split),
             "seed": int(seed),
             "shuffle": bool(shuffle),
-            # NEW:
             "train_idx": [int(i) for i in train_idx],
             "val_idx": [int(i) for i in val_idx],
         }
+
         print(f"Train size: {len(train_idx)}, val size: {len(val_idx)}")
         return train_idx, val_idx, split_info
 
@@ -196,7 +218,6 @@ def make_split_indices(
         code_to_idx = {code: i for i, code in enumerate(subject_codes)}
         holdout_ids = {code_to_idx[c] for c in holdout_subjects}
 
-        # NOTE: subj_ids values in your pipeline behave like integer indices already
         val_idx = [i for i in range(n) if int(subj_ids[i]) in holdout_ids]
         train_idx = [i for i in range(n) if int(subj_ids[i]) not in holdout_ids]
 
@@ -205,10 +226,10 @@ def make_split_indices(
             "holdout_subjects": list(holdout_subjects),
             "holdout_subject_indices": sorted(list(holdout_ids)),
             "seed": int(seed),
-            # NEW:
             "train_idx": [int(i) for i in train_idx],
             "val_idx": [int(i) for i in val_idx],
         }
+
         print(f"Held out subjects {holdout_subjects} -> val trials: {len(val_idx)}")
         print(f"Train size: {len(train_idx)}, val size: {len(val_idx)}")
         return train_idx, val_idx, split_info
@@ -229,12 +250,12 @@ def make_split_indices(
             "holdout_fraction": float(holdout_sent_fraction),
             "holdout_count": int(n_holdout),
             "seed": int(seed),
-            # NEW:
             "train_idx": [int(i) for i in train_idx],
             "val_idx": [int(i) for i in val_idx],
-            # Optional (doesn't change behavior, but nice for debugging):
+            # Useful for debugging, but left disabled to avoid changing saved outputs.
             # "holdout_sentences": sorted(list(holdout_sents)),
         }
+
         print(f"Held out {n_holdout}/{len(unique_sents)} sentences -> val trials: {len(val_idx)}")
         print(f"Train size: {len(train_idx)}, val size: {len(val_idx)}")
         return train_idx, val_idx, split_info
@@ -242,22 +263,34 @@ def make_split_indices(
     raise ValueError(f"Unknown split_mode: {split_mode}")
 
 
-# ----------------- Loss & metrics -----------------
+# ----------------- Loss and metrics -----------------
 
-def contrastive_loss(eeg_emb: torch.Tensor, text_emb: torch.Tensor, temperature: float):
+def contrastive_loss(
+    eeg_emb: torch.Tensor,
+    text_emb: torch.Tensor,
+    temperature: float,
+):
     eeg_emb = nn.functional.normalize(eeg_emb, dim=-1)
     text_emb = nn.functional.normalize(text_emb, dim=-1)
 
     logits = eeg_emb @ text_emb.T / temperature
     labels = torch.arange(eeg_emb.size(0), device=eeg_emb.device)
+
     loss_i = nn.functional.cross_entropy(logits, labels)
     loss_t = nn.functional.cross_entropy(logits.T, labels)
+
     return (loss_i + loss_t) / 2.0, logits
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, temperature: float):
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    temperature: float,
+):
     model.eval()
+
     total_loss = 0.0
     total = 0
     total_acc1 = 0.0
@@ -273,6 +306,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, tempera
         loss, logits = contrastive_loss(eeg_emb, text, temperature)
 
         B = eeg.size(0)
+
         total_loss += loss.item() * B
         total += B
 
@@ -307,6 +341,7 @@ def train_one_epoch(
     log_every_steps: int,
 ):
     model.train()
+
     total_loss = 0.0
     total = 0
 
@@ -316,11 +351,13 @@ def train_one_epoch(
         text = batch["target"].to(device)
 
         optimizer.zero_grad()
+
         eeg_emb = model(eeg, subj)
         loss, _ = contrastive_loss(eeg_emb, text, temperature)
 
         loss.backward()
         optimizer.step()
+
         if scheduler is not None:
             scheduler.step()
 
@@ -336,9 +373,8 @@ def train_one_epoch(
 # ----------------- Model -----------------
 
 class EEGToTextEmbedModel(nn.Module):
-    """
-    Optional frontend -> optional BrainModule -> always-on prediction head.
-    """
+    """EEG frontend, optional BrainModule, then a small projection head."""
+
     def __init__(
         self,
         n_channels: int,
@@ -364,11 +400,11 @@ class EEGToTextEmbedModel(nn.Module):
         use_residual_blocks: bool,
     ):
         super().__init__()
+
         self.pooling = pooling
         self.use_frontend = use_frontend
         self.use_brainmodule = use_brainmodule
 
-        # 1) Frontend (optional)
         if self.use_frontend:
             if use_eegnet:
                 self.eeg_frontend = EEGFrontEnd(
@@ -379,14 +415,16 @@ class EEGToTextEmbedModel(nn.Module):
                 )
                 frontend_out_ch = eegnet_F1 * eegnet_D
             else:
-                # Simple alternative: 1x1 conv to map raw channels to a chosen feature width
-                self.eeg_frontend = nn.Conv1d(n_channels, raw_frontend_out_ch, kernel_size=1)
+                self.eeg_frontend = nn.Conv1d(
+                    n_channels,
+                    raw_frontend_out_ch,
+                    kernel_size=1,
+                )
                 frontend_out_ch = raw_frontend_out_ch
         else:
             self.eeg_frontend = nn.Identity()
             frontend_out_ch = n_channels
 
-        # 2) BrainModule (optional)
         if self.use_brainmodule:
             self.brain = BrainModule(
                 in_channels=frontend_out_ch,
@@ -400,6 +438,7 @@ class EEGToTextEmbedModel(nn.Module):
                 use_subject_layer=use_subject_layer,
                 use_residual_blocks=use_residual_blocks,
             )
+
             self.sensor_pos = nn.Parameter(torch.randn(frontend_out_ch, 2) * 0.1)
             pred_in_dim = latent_dim
         else:
@@ -407,7 +446,6 @@ class EEGToTextEmbedModel(nn.Module):
             self.sensor_pos = None
             pred_in_dim = frontend_out_ch
 
-        # 3) Prediction head (always on)
         self.proj = nn.Sequential(
             nn.Linear(pred_in_dim, pred_in_dim),
             nn.ReLU(),
@@ -420,7 +458,7 @@ class EEGToTextEmbedModel(nn.Module):
         if self.brain is not None:
             z = self.brain(x, self.sensor_pos, subject_ids)  # (B, latent_dim, T')
         else:
-            z = x  # bypass BrainModule entirely
+            z = x
 
         if self.pooling == "mean":
             z = z.mean(dim=-1)
@@ -432,12 +470,15 @@ class EEGToTextEmbedModel(nn.Module):
         e = self.proj(z)
         return nn.functional.normalize(e, dim=-1)
 
+
 class _CHISCOBaselineWrapper(nn.Module):
     """
-    Keeps the same call signature as your current model:
-      forward(eeg, subject_ids) -> embedding
-    even though CHISCO baseline doesn't use subject_ids.
+    Adapter so the CHISCO baseline can be called as model(eeg, subject_ids).
+
+    The baseline itself does not use subject IDs, but keeping the signature the
+    same avoids branching in the training and evaluation loops.
     """
+
     def __init__(self, encoder: nn.Module):
         super().__init__()
         self.encoder = encoder
@@ -450,25 +491,37 @@ class _CHISCOBaselineWrapper(nn.Module):
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Train EEG→text embedding model (CHISCO) with contrastive loss (CLI)."
+        description="Train EEG→text embedding model (CHISCO) with contrastive loss."
     )
 
-    # Paths / data
+    # Paths and data
     p.add_argument("--chisco-root", type=str, default="./ds005170/derivatives/preprocessed_pkl")
     p.add_argument("--sent-emb-path", type=str, default="./ds005170/json/sentence_bert_embs.json")
     p.add_argument("--task", type=str, default="imagine", choices=["read", "imagine", "combined"])
-    p.add_argument("--subject-codes", type=str, default="01,02,03,04,05",
-                   help="Comma-separated subject codes, e.g. 01,02,03,04,05")
+    p.add_argument(
+        "--subject-codes",
+        type=str,
+        default="01,02,03,04,05",
+        help="Comma-separated subject codes, e.g. 01,02,03,04,05",
+    )
     p.add_argument("--train-data-fraction", type=float, default=1.0)
 
     # Split
-    p.add_argument("--split-mode", type=str, default="unseen_sentence",
-                   choices=["iid", "unseen_subject", "unseen_sentence"])
+    p.add_argument(
+        "--split-mode",
+        type=str,
+        default="unseen_sentence",
+        choices=["iid", "unseen_subject", "unseen_sentence"],
+    )
     p.add_argument("--val-split", type=float, default=0.2)
     p.add_argument("--shuffle-data", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--holdout-subjects", type=str, default="05",
-                   help="Comma-separated subject codes to hold out, e.g. 05")
+    p.add_argument(
+        "--holdout-subjects",
+        type=str,
+        default="05",
+        help="Comma-separated subject codes to hold out, e.g. 05",
+    )
     p.add_argument("--holdout-sent-fraction", type=float, default=0.2)
 
     # Training
@@ -487,38 +540,60 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--jitter-max", type=int, default=10)
     p.add_argument("--channel-dropout-p", type=float, default=0.05)
 
-    # Model dims
+    # Model dimensions
     p.add_argument("--hidden-channels", type=int, default=256)
     p.add_argument("--final-hidden", type=int, default=256)
     p.add_argument("--n-blocks", type=int, default=5)
     p.add_argument("--latent-dim", type=int, default=256)
     p.add_argument("--pooling", type=str, default="mean", choices=["mean", "max"])
 
-    # Toggle model parts
-    p.add_argument("--use-frontend", action=argparse.BooleanOptionalAction, default=True,
-                   help="Enable stage 1 frontend. If false, raw EEG goes directly to the BrainModule or prediction head.")
-    p.add_argument("--use-brainmodule", action=argparse.BooleanOptionalAction, default=True,
-                   help="Enable stage 2 BrainModule. If false, frontend/raw features go directly to the prediction head.")
-    p.add_argument("--use-eegnet", action=argparse.BooleanOptionalAction, default=True,
-                   help="If stage 1 frontend is enabled, use EEGNet-style frontend. If false, uses a simple 1x1 conv.")
+    # Model toggles
+    p.add_argument(
+        "--use-frontend",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the stage 1 frontend. If disabled, raw EEG goes straight to the BrainModule or prediction head.",
+    )
+    p.add_argument(
+        "--use-brainmodule",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the BrainModule. If disabled, frontend/raw features go straight to the prediction head.",
+    )
+    p.add_argument(
+        "--use-eegnet",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use EEGNet-style frontend. If disabled, uses a simple 1x1 convolution.",
+    )
     p.add_argument("--eegnet-temporal-kern", type=int, default=64)
     p.add_argument("--eegnet-f1", type=int, default=16)
     p.add_argument("--eegnet-d", type=int, default=2)
-    p.add_argument("--raw-frontend-out-ch", type=int, default=32,
-                   help="If --no-use-eegnet: output channels of the simple 1x1 conv frontend.")
+    p.add_argument(
+        "--raw-frontend-out-ch",
+        type=int,
+        default=32,
+        help="Output channels for the simple 1x1 convolution frontend.",
+    )
 
     p.add_argument("--use-spatial-attn", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use-subject-layer", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use-residual-blocks", action=argparse.BooleanOptionalAction, default=True)
 
-    # Baseline stuff
-    p.add_argument("--arch", type=str, default="brainmodule",
-                   choices=["brainmodule", "chisco_baseline"])
-
-    p.add_argument("--baseline-layer", type=int, default=0)  # transformer layers (like CHISCO)
-    p.add_argument("--baseline-pooling", type=str, default="mean",
-                   choices=["mean", "sums", "tops"])
-
+    # Baseline model
+    p.add_argument(
+        "--arch",
+        type=str,
+        default="brainmodule",
+        choices=["brainmodule", "chisco_baseline"],
+    )
+    p.add_argument("--baseline-layer", type=int, default=0)
+    p.add_argument(
+        "--baseline-pooling",
+        type=str,
+        default="mean",
+        choices=["mean", "sums", "tops"],
+    )
     p.add_argument("--baseline-size1", type=int, default=8)
     p.add_argument("--baseline-size2", type=int, default=8)
     p.add_argument("--baseline-feel1", type=int, default=125)
@@ -527,19 +602,20 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--baseline-dropout2", type=float, default=0.1)
     p.add_argument("--baseline-latent-dim", type=int, default=256)
 
-    # Logging / output
+    # Logging and output
     p.add_argument("--exp-root", type=str, default="experiments")
     p.add_argument("--experiment-name", type=str, default="eeg2text")
     p.add_argument("--no-plots", action=argparse.BooleanOptionalAction, default=False)
 
-    # Device
+    # Runtime
     p.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     p.add_argument(
         "--split-file",
         type=str,
         default="splits/train_val_test_split.json",
-        help="Path to sentence-based split_info.json."
+        help="Path to sentence-based split_info.json.",
     )
+
     return p
 
 
@@ -554,7 +630,7 @@ def main():
     device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
     print("Using device:", device)
 
-    # Load data
+    # Load EEG and text targets.
     X, sentences, subj_ids, text_targets = build_eeg_text_embed_tensors(
         chisco_root=args.chisco_root,
         sent_emb_path=args.sent_emb_path,
@@ -565,7 +641,7 @@ def main():
     n_samples, n_channels, _ = X.shape
     text_dim = text_targets.shape[1]
 
-    # Split
+    # Load the sentence-level split used for train/val/test.
     if args.split_file is not None:
         print(f"Loading sentence split from: {args.split_file}")
 
@@ -599,8 +675,9 @@ def main():
     split_info["train_data_fraction"] = float(args.train_data_fraction)
     split_info["train_size_after_fraction"] = len(train_idx)
 
-    # Logger path structure: <exp-root>/<experiment-name>/<task>/<split-mode>/<run_id>/
+    # Logger path: <exp-root>/<experiment-name>/<task>/<split-mode>/<run_id>/
     task_name = os.path.join(args.experiment_name, args.task, split_info["split_mode"])
+
     config_dict = uppercase_config_from_args(args)
     config_dict["subject_codes"] = subject_codes
     config_dict["holdout_subjects"] = holdout_subjects
@@ -658,7 +735,6 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
     )
-
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -674,7 +750,10 @@ def main():
         if (not args.use_brainmodule) and (
             args.use_spatial_attn or args.use_subject_layer or args.use_residual_blocks
         ):
-            print("Warning: BrainModule is disabled, so --use-spatial-attn/--use-subject-layer/--use-residual-blocks are ignored.")
+            print(
+                "Warning: BrainModule is disabled, so "
+                "--use-spatial-attn/--use-subject-layer/--use-residual-blocks are ignored."
+            )
 
         model = EEGToTextEmbedModel(
             n_channels=n_channels,
@@ -698,7 +777,6 @@ def main():
         ).to(device)
 
     elif args.arch == "chisco_baseline":
-        # Baseline ignores subject ids (kept in the training loop unchanged)
         model = _CHISCOBaselineWrapper(
             encoder=CHISCOBaselineEEGEncoder(
                 n_channels=n_channels,
@@ -733,8 +811,9 @@ def main():
         num_training_steps=total_steps,
     )
 
-    # Train
+    # Training loop
     best_val_acc10 = -1e9
+
     train_loss_hist: List[float] = []
     val_loss_hist: List[float] = []
     val_acc1_hist: List[float] = []
@@ -767,14 +846,17 @@ def main():
             f"| Acc@5 {val_acc5:.2f}% | Acc@10 {val_acc10:.2f}%"
         )
 
-        # logger: metrics
         logger.log_epoch(
             epoch=epoch,
             train_stats={"loss": float(train_loss)},
-            val_stats={"loss": float(val_loss), "acc1": float(val_acc1), "acc5": float(val_acc5), "acc10": float(val_acc10)},
+            val_stats={
+                "loss": float(val_loss),
+                "acc1": float(val_acc1),
+                "acc5": float(val_acc5),
+                "acc10": float(val_acc10),
+            },
         )
 
-        # logger: last checkpoint
         logger.save_last({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -783,12 +865,17 @@ def main():
             "config": config_dict,
             "split_info": split_info,
             "train": {"loss": float(train_loss)},
-            "val": {"loss": float(val_loss), "acc1": float(val_acc1), "acc5": float(val_acc5), "acc10": float(val_acc10)},
+            "val": {
+                "loss": float(val_loss),
+                "acc1": float(val_acc1),
+                "acc5": float(val_acc5),
+                "acc10": float(val_acc10),
+            },
         })
 
-        # logger: best checkpoint
         if val_acc10 > best_val_acc10:
             best_val_acc10 = val_acc10
+
             did_save = logger.maybe_save_best(
                 epoch=epoch,
                 metric_value=float(val_acc10),
@@ -801,11 +888,20 @@ def main():
                     "split_info": split_info,
                     "best_val_acc10": float(best_val_acc10),
                     "train": {"loss": float(train_loss)},
-                    "val": {"loss": float(val_loss), "acc1": float(val_acc1), "acc5": float(val_acc5), "acc10": float(val_acc10)},
+                    "val": {
+                        "loss": float(val_loss),
+                        "acc1": float(val_acc1),
+                        "acc5": float(val_acc5),
+                        "acc10": float(val_acc10),
+                    },
                 },
             )
+
             if did_save:
-                print(f"Saved NEW BEST -> {logger.run_dir}/best_checkpoint.pt (val_acc@10={best_val_acc10:.2f}%)")
+                print(
+                    f"Saved NEW BEST -> {logger.run_dir}/best_checkpoint.pt "
+                    f"(val_acc@10={best_val_acc10:.2f}%)"
+                )
 
         train_loss_hist.append(float(train_loss))
         val_loss_hist.append(float(val_loss))
@@ -825,10 +921,11 @@ def main():
         f"| Acc@5 {test_acc5:.2f}% | Acc@10 {test_acc10:.2f}%"
     )
 
-    # Plots inside experiment folder
+    # Save simple training plots.
     if not args.no_plots:
         plots_dir = os.path.join(logger.run_dir, "plots")
         os.makedirs(plots_dir, exist_ok=True)
+
         epochs = range(1, args.num_epochs + 1)
 
         plt.figure()

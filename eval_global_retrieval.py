@@ -1,20 +1,3 @@
-# eval_global_retrieval.py
-#
-# Evaluate EEG→text embeddings via *global retrieval* using one saved experiment folder.
-#
-# Usage:
-#   python eval_global_retrieval.py --exp-dir experiments/eeg2text/read/iid/<run_id>
-#
-# Functionality is intended to be IDENTICAL to the original version:
-#   - loads best_checkpoint.pt
-#   - loads config.json and split.json from that run folder
-#   - reconstructs the exact validation set for:
-#       iid / unseen_sentence / unseen_subject
-#   - evaluates global retrieval against ALL sentence embeddings in SENT_EMB_PATH
-#
-# The ONLY change is memory behavior:
-#   - Instead of loading X=(N,C,T) into RAM, we build a streaming index and load trials on-demand.
-
 import os
 import sys
 import json
@@ -26,10 +9,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
-# Make ds005170 importable
 sys.path.append("./ds005170")
 
-# Reuse the same low-level loaders (so preprocessing stays consistent)
 from data_loader import load_read_run, load_imagine_run  # type: ignore
 
 from train_script_with_split import EEGToTextEmbedModel, _CHISCOBaselineWrapper
@@ -61,7 +42,6 @@ def read_json(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 def load_sentence_embeddings(path: str) -> Dict[str, List[float]]:
-    # Keep identical behavior: read the json map sentence -> embedding(list[float])
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -86,92 +66,6 @@ def make_train_val_indices(n: int, val_split: float, shuffle: bool, seed: int) -
     return train_idx, val_idx
 
 
-# def split_indices_from_splitinfo(
-#         split_info: Dict[str, Any],
-#         sentences: List[str],
-#         subj_ids: torch.Tensor,
-#         subject_codes: List[str],
-#         seed: int,
-#         val_split: float,
-#         shuffle: bool,
-# ) -> Tuple[List[int], List[int]]:
-#     """
-#     Force the use of explicit indices saved in split.json.
-#     Throws an error if they are missing to prevent split mismatch.
-#     """
-#     # Force usage of saved indices
-#     if "train_idx" in split_info and "val_idx" in split_info:
-#         train_idx = split_info["train_idx"]
-#         val_idx = split_info["val_idx"]
-#
-#         # Basic sanity check
-#         if not val_idx:
-#             raise ValueError("The 'val_idx' list in split.json is empty.")
-#
-#         return train_idx, val_idx
-#
-#     # If the keys are missing, we throw a hard error instead of guessing the RNG
-#     mode = split_info.get("split_mode", "unknown")
-#     raise KeyError(
-#         f"CRITICAL ERROR: 'train_idx' or 'val_idx' not found in split.json. "
-#         f"Evaluation for mode '{mode}' cannot proceed safely because the "
-#         f"original training indices are required to prevent data leakage or set mismatch."
-#     )
-
-
-# def split_indices_from_splitinfo(
-#     split_info: Dict[str, Any],
-#     sentences: List[str],
-#     subj_ids: torch.Tensor,
-#     subject_codes: List[str],
-#     seed: int,
-#     val_split: float,
-#     shuffle: bool,
-# ) -> Tuple[List[int], List[int]]:
-#     """
-#     Recreate the split based on split.json.
-#
-#     (Kept identical to your original logic.)
-#     """
-#     mode = split_info.get("split_mode", "iid")
-#     n = len(sentences)
-#
-#     if mode == "iid":
-#         _, val_idx = make_train_val_indices(n, val_split=val_split, shuffle=shuffle, seed=seed)
-#         return list(range(n))[int(n * val_split):], val_idx  # train_idx, val_idx
-#
-#     if mode == "unseen_sentence":
-#         holdout_sents = split_info.get("holdout_sentences", None)
-#         if holdout_sents is None:
-#             frac = float(split_info["holdout_fraction"])
-#             rng = np.random.default_rng(seed)
-#             unique = sorted(set(sentences))
-#             rng.shuffle(unique)
-#             n_holdout = max(1, int(len(unique) * frac))
-#             holdout_sents = set(unique[:n_holdout])
-#         else:
-#             holdout_sents = set(holdout_sents)
-#
-#         val_idx = [i for i, s in enumerate(sentences) if s in holdout_sents]
-#         train_idx = [i for i, s in enumerate(sentences) if s not in holdout_sents]
-#         return train_idx, val_idx
-#
-#     if mode == "unseen_subject":
-#         holdout_codes = split_info.get("holdout_subjects", None)
-#         if holdout_codes is None:
-#             raise ValueError("split.json missing holdout_subjects for unseen_subject evaluation.")
-#
-#         code_to_idx = {c: i for i, c in enumerate(subject_codes)}
-#         holdout_ids = {code_to_idx[c] for c in holdout_codes}
-#
-#         val_idx = [i for i in range(n) if int(subj_ids[i]) in holdout_ids]
-#         train_idx = [i for i in range(n) if int(subj_ids[i]) not in holdout_ids]
-#         return train_idx, val_idx
-#
-#     raise ValueError(f"Unknown split_mode in split.json: {mode}")
-
-
-# -------------------- streaming dataset --------------------
 
 @dataclass(frozen=True)
 class TrialRef:
@@ -224,7 +118,6 @@ class ChiscoStreamingEvalDataset(Dataset):
         trial = trials[ref.trial_in_run]
 
         arr = trial["input_features"]  # (1, 125, 1651), float64
-        # Keep preprocessing consistent with your CHISCO code:
         eeg = arr[0, :122, :] * 1_000_000.0
         eeg = eeg.astype(np.float32)
         eeg = torch.from_numpy(eeg)  # (122, 1651)
@@ -246,14 +139,7 @@ def build_streaming_index(
     n_runs_read: int = 45,
     n_runs_imagine: int = 45,
 ) -> Tuple[List[TrialRef], List[str], torch.Tensor]:
-    """
-    Build an index without ever stacking EEG into RAM.
 
-    Returns:
-      - trial_index: List[TrialRef] (length N)
-      - sentences  : List[str]      (length N)  (same order as trial_index)
-      - subj_ids   : Long tensor    (length N)  (same order as trial_index)
-    """
     trial_index: List[TrialRef] = []
     sentences: List[str] = []
     subj_ids: List[int] = []
@@ -294,7 +180,6 @@ def build_streaming_index(
 
 
 def _batch_value(batch, key: str, i: int):
-    """Return a JSON-serializable scalar/list item from a DataLoader-collated batch."""
     value = batch[key]
     if torch.is_tensor(value):
         return value[i].item()
@@ -312,10 +197,7 @@ def evaluate_global_retrieval_streaming(
     batch_size: int = 32,
     topk_max: int = 50,
 ) -> Dict[str, float]:
-    """
-    Same metric logic as your original evaluate_global_retrieval(),
-    but data comes from a streaming dataset instead of a giant X tensor.
-    """
+
     model.eval()
     text_matrix = text_matrix.to(device)
 
@@ -344,14 +226,12 @@ def evaluate_global_retrieval_streaming(
             sent = str(sent).strip()
             true_id = sentence_to_id.get(sent, None)
 
-            # Stable identifiers for pairing this trial across model runs.
             sub_code = str(_batch_value(batch, "sub_code", i))
             run_idx = int(_batch_value(batch, "run_idx", i))
             trial_in_run = int(_batch_value(batch, "trial_in_run", i))
             stable_trial_id = f"{sub_code}_run{run_idx:02d}_trial{trial_in_run:04d}"
 
             if true_id is None:
-                # Keep identical aggregate behavior to original: count in total, but skip scoring.
                 trial_rows.append({
                     "trial_number": int(trial_number),
                     "trial_id": stable_trial_id,
@@ -410,7 +290,6 @@ def evaluate_global_retrieval_streaming(
     }
 
 
-# -------------------- main --------------------
 
 def main():
     ap = argparse.ArgumentParser(description="Evaluate global retrieval for an experiment run folder.")
@@ -445,7 +324,6 @@ def main():
     device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
     print("Using device:", device)
 
-    # Pull required fields from config.json (unchanged)
     chisco_root = cfg.get("chisco_root") or cfg.get("CHISCO_ROOT") or "./ds005170/derivatives/preprocessed_pkl"
     sent_emb_path = cfg.get("sent_emb_path") or cfg.get("SENT_EMB_PATH") or "./ds005170/json/sentence_bert_embs.json"
     task = cfg.get("task") or cfg.get("TASK") or "read"
@@ -458,31 +336,15 @@ def main():
     else:
         subject_codes = cfg.get("SUBJECT_CODES") or [f"{i:02d}" for i in range(1, 6)]
 
-    seed = int(cfg.get("seed") or cfg.get("RANDOM_SEED") or split_info.get("seed") or 42)
-    val_split = float(cfg.get("val_split") or cfg.get("VAL_SPLIT") or 0.2)
-    shuffle = bool(cfg.get("shuffle_data") if "shuffle_data" in cfg else cfg.get("SHUFFLE_DATA", True))
-
-    # 1) Build a streaming index (NO X tensor)
     trial_index, sentences, subj_ids = build_streaming_index(
         root=chisco_root,
         subject_codes=subject_codes,
         task=task,
     )
 
-    n_samples = len(sentences)
     n_channels = 122  # fixed by preprocessing
     n_subjects = len(subject_codes)
 
-    # 2) Recreate exact split (same code path, just using our sentences/subj_ids lists)
-    # train_idx, val_idx = split_indices_from_splitinfo(
-    #     split_info=split_info,
-    #     sentences=sentences,
-    #     subj_ids=subj_ids,
-    #     subject_codes=subject_codes,
-    #     seed=seed,
-    #     val_split=val_split,
-    #     shuffle=shuffle,
-    # )
 
     train_idx, val_idx, test_idx = split_indices_from_splitinfo(
         split_info=split_info,
@@ -496,13 +358,11 @@ def main():
     print(f"Split mode  : {split_mode}")
     print(f"Val trials  : {len(val_idx)}")
 
-    # 3) Load text vocab matrix (unchanged)
     sent2emb = load_sentence_embeddings(sent_emb_path)
     text_matrix, id_to_sentence, sentence_to_id = build_text_embedding_matrix(sent2emb)
     text_dim = int(text_matrix.shape[1])
     print(f"Text vocab size: {len(id_to_sentence)} | text_dim={text_dim}")
 
-    # 4) Build model from checkpoint/config (unchanged)
     checkpoint = torch.load(ckpt_path, map_location=device)
 
     c2 = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
@@ -575,10 +435,9 @@ def main():
             raw_frontend_out_ch=raw_frontend_out_ch,
         ).to(device)
 
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
 
-    # 5) Streaming val dataset + eval (THIS is the memory fix)
     base_ds = ChiscoStreamingEvalDataset(root=chisco_root, trial_index=trial_index)
     val_ds = Subset(base_ds, test_idx)
 

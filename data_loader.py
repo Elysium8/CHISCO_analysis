@@ -3,15 +3,9 @@ import pickle
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-
-# ============================================================
-# Low-level: robust run file loading (padding mismatch safe)
-# ============================================================
 
 def _trial_to_eeg_and_sentence(
     trial: dict,
@@ -72,10 +66,6 @@ def load_read_run(root: str, sub_code: str, run_idx: int) -> List[dict]:
     with open(path, "rb") as f:
         return pickle.load(f)
 
-
-# ============================================================
-# In-memory loaders (kept for compatibility; RAM-heavy)
-# ============================================================
 
 def load_subject_imagine_trials(
     root: str,
@@ -287,9 +277,6 @@ def load_chisco_combined_all_subjects(
 
 
 class ChiscoImagineDataset(Dataset):
-    """
-    In-memory dataset (unchanged). Kept for compatibility.
-    """
     def __init__(
         self,
         eeg: torch.Tensor,
@@ -346,10 +333,6 @@ class ChiscoImagineDataset(Dataset):
         return sample
 
 
-# ============================================================
-# STREAMING / ON-DISK Dataset (Option 3)
-# ============================================================
-
 @dataclass(frozen=True)
 class _TrialRef:
     sub_code: str
@@ -360,10 +343,6 @@ class _TrialRef:
 
 
 class _RunCache:
-    """
-    Very small cache of loaded run trial lists.
-    Keeps peak memory bounded while reducing disk I/O.
-    """
     def __init__(self, cache_size: int = 2):
         self.cache_size = int(cache_size)
         self._cache: "OrderedDict[Tuple[str,int], List[dict]]" = OrderedDict()
@@ -382,21 +361,6 @@ class _RunCache:
 
 
 class ChiscoStreamingDataset(Dataset):
-    """
-    Streaming dataset that mirrors the sample dict keys your training loop expects:
-      - "eeg"        : FloatTensor (122, 1651)
-      - "subject_id" : LongTensor scalar
-      - "target"     : FloatTensor (D,)
-      - "sentence"   : str (kept for split + debugging)
-
-    Also exposes:
-      - self.sentences (List[str]) aligned with indices
-      - self.subject_ids (torch.LongTensor) aligned with indices
-
-    This dataset builds a lightweight index once (sentences + refs),
-    then loads only the required run file on demand in __getitem__.
-    """
-
     def __init__(
         self,
         root: str,

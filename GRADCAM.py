@@ -1,25 +1,3 @@
-# GRADCAM.py
-#
-# Standalone post-hoc analysis script:
-# - loads an existing run folder (config.json, split.json, best/last checkpoint)
-# - computes:
-#   (1) Temporal Grad-CAM (BrainModule output) aggregated over ENTIRE validation set
-#       and upsampled back to original EEG timepoints
-#   (2) Spatial (electrode/channel) saliency aggregated over ENTIRE validation set
-#       using mean(|∂score/∂EEG_channel(t)|) over time
-#   (3) OPTIONAL: Spatial scalp topomap using montage.csv + channels.txt
-#   (4) OPTIONAL: Spatiotemporal (Option 1): time-resolved input-gradient topomaps
-#       as a grid across equal-length time slices (dynamic for read vs imagine durations)
-#
-# UPDATE (minimal alteration): can now take a root directory containing multiple experiment
-# subfolders. It will:
-#   - iterate over run subfolders
-#   - group runs by task ("read" vs "imagine") based on config.json["task"]
-#   - aggregate (sum / sq_sum / counts) across runs within each task
-#   - produce plots for read and imagine separately
-#
-# Windows-friendly defaults: num_workers=0, pin_memory=False.
-
 import os
 import sys
 import json
@@ -33,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-# Optional deps for scalp topomap
 try:
     import pandas as pd
     import mne
@@ -42,11 +19,8 @@ except Exception:
     mne = None
 
 
-# Ensure we can import ds005170 modules if your project uses that layout
 sys.path.append("./ds005170")
 
-# Import model + dataset class from your training codebase.
-# Make sure this file is alongside updated_train_eeg_to_text_RAM.py (or adjust import).
 from updated_train_eeg_to_text_RAM import EEGToTextEmbedModel  # type: ignore
 from data_loader import ChiscoStreamingDataset  # type: ignore
 
@@ -57,7 +31,7 @@ def load_json(path: str) -> Dict[str, Any]:
 
 
 def load_sentence_embeddings(path: str) -> Dict[str, np.ndarray]:
-    """Load sentence embeddings JSON as float32 NumPy arrays (RAM-friendly)."""
+    """Read sentence embeddings into float32 arrays."""
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
     out: Dict[str, np.ndarray] = {}
@@ -86,14 +60,12 @@ def indices_from_sentence_split(sentences, split_sentences):
         if normalize_sentence(s) in split_set
     ]
 
+
 def upsample_cam_to_input_length(cam_Tprime: torch.Tensor, T: int) -> torch.Tensor:
-    """
-    cam_Tprime: (B, T') in [0,1]
-    returns:    (B, T)  in [0,1]
-    """
-    cam = cam_Tprime.unsqueeze(1)  # (B, 1, T')
+    """Stretch the Grad-CAM sequence back to the original EEG length."""
+    cam = cam_Tprime.unsqueeze(1)
     cam_up = F.interpolate(cam, size=T, mode="linear", align_corners=False)
-    return cam_up.squeeze(1)       # (B, T)
+    return cam_up.squeeze(1)
 
 
 def read_channel_list(path: str) -> List[str]:
@@ -107,9 +79,7 @@ def build_info_from_montage(
     montage_csv: str,
     sfreq: float,
 ) -> "mne.Info":
-    """
-    Create an MNE Info with montage positions from montage.csv + channels.txt.
-    """
+    """Build the MNE channel metadata needed for topomap plots."""
     if mne is None or pd is None:
         raise RuntimeError("Topomap requires mne + pandas. Install with: pip install mne pandas")
 
@@ -145,16 +115,12 @@ def compute_time_slices(
     timeslice_sec: float,
     timeslice_count: int,
 ) -> Tuple[List[Tuple[int, int]], np.ndarray]:
-    """
-    Returns:
-      slices: list of (lo, hi) sample indices, hi exclusive
-      times_sec: ndarray shape (K,2) start/end times in seconds
-    """
+    """Split an EEG recording into sample ranges and matching time ranges."""
     if timeslice_sec > 0:
         slice_len = max(1, int(round(timeslice_sec * fs)))
         K = int(math.ceil(T / slice_len))
     else:
-        # auto: roughly timeslice_count slices
+        # Let the caller request a rough number of slices instead.
         K = max(1, int(timeslice_count))
         slice_len = int(math.ceil(T / K))
 
@@ -172,18 +138,15 @@ def compute_time_slices(
 
 
 class TemporalGradCAM:
-    """
-    Temporal Grad-CAM on the BrainModule output z: (B, latent_dim, T')
-    PLUS spatial (input channel) saliency via eeg.grad: (B, C)
-    ALSO returns abs input gradients over time: (B, C, T) for spatiotemporal topomaps.
-    """
+    """Small wrapper for temporal Grad-CAM and input-channel saliency."""
+
     def __init__(self, model: nn.Module):
         self.model = model
         self._z: Optional[torch.Tensor] = None
         self._hook = model.brain.register_forward_hook(self._forward_hook)
 
     def _forward_hook(self, module, inp, out):
-        # out is z: (B, latent_dim, T')
+        # The brain module returns z with shape (B, latent_dim, T').
         self._z = out
         self._z.retain_grad()
 
@@ -191,48 +154,42 @@ class TemporalGradCAM:
         self._hook.remove()
 
     def compute(self, eeg: torch.Tensor, subj: torch.Tensor, text: torch.Tensor):
-        """
-        Returns:
-          cam_Tprime: (B, T') temporal Grad-CAM (normalized per-sample to [0,1])
-          score_per_sample: (B,) cosine similarity per sample
-          chan_imp: (B, C_in) mean(|∂score/∂EEG|) over time per input channel
-          grad_abs_time: (B, C_in, T) abs input gradient over time (for spatiotemporal maps)
-        """
+        """Return temporal CAM, cosine scores, channel saliency, and raw gradients."""
         self.model.zero_grad(set_to_none=True)
 
-        # enable gradient on raw input EEG
+        # We need gradients at the input for the channel and topomap views.
         eeg = eeg.requires_grad_(True)
 
-        # Forward
-        eeg_emb = self.model(eeg, subj)  # (B, D), normalized in your forward
+        # Compare the EEG embedding with its target text embedding.
+        eeg_emb = self.model(eeg, subj)
         text_n = F.normalize(text, dim=-1)
 
-        score_per_sample = (eeg_emb * text_n).sum(dim=-1)  # (B,)
+        score_per_sample = (eeg_emb * text_n).sum(dim=-1)
         score = score_per_sample.sum()
         score.backward()
 
-        # --- Temporal CAM on BrainModule output ---
+        # Temporal Grad-CAM on the brain-module output.
         z = self._z
         if z is None or z.grad is None:
             raise RuntimeError("Grad-CAM: missing z or z.grad. Did the hook run?")
 
-        g = z.grad  # (B, C_lat, T')
-        w = g.mean(dim=1)  # (B, T')
-        cam_Tprime = (z * w.unsqueeze(1)).sum(dim=1)  # (B, T')
+        g = z.grad
+        w = g.mean(dim=1)
+        cam_Tprime = (z * w.unsqueeze(1)).sum(dim=1)
         cam_Tprime = F.relu(cam_Tprime)
 
-        # Normalize per sample to [0,1]
+        # Keep each sample on the same 0-1 scale before averaging.
         cam_min = cam_Tprime.min(dim=-1, keepdim=True).values
         cam_max = cam_Tprime.max(dim=-1, keepdim=True).values
         cam_Tprime = (cam_Tprime - cam_min) / (cam_max - cam_min + 1e-8)
 
-        # --- Spatial saliency over input EEG channels ---
+        # Spatial saliency from gradients on the input EEG.
         if eeg.grad is None:
             raise RuntimeError("Expected eeg.grad but got None.")
-        grad_abs_time = eeg.grad.abs()              # (B, C, T)
-        chan_imp = grad_abs_time.mean(dim=-1)       # (B, C)
+        grad_abs_time = eeg.grad.abs()
+        chan_imp = grad_abs_time.mean(dim=-1)
 
-        # Free hook reference
+        # Drop the stored activation so the next batch starts clean.
         self._z = None
 
         return cam_Tprime.detach(), score_per_sample.detach(), chan_imp.detach(), grad_abs_time.detach()
@@ -248,22 +205,17 @@ def _is_run_dir(path: str, checkpoint_name: str) -> bool:
 
 
 def _discover_run_dirs(runs_root: str, checkpoint_name: str) -> List[str]:
-    """
-    Discover run directories under runs_root.
-    Minimal assumption: immediate subfolders are runs, but we also allow nested
-    (one level deeper) if you have a structure like runs_root/task/run_x.
-    """
     runs: List[str] = []
     if not os.path.isdir(runs_root):
         return runs
 
-    # First pass: immediate children
+    # Most run roots are laid out as direct children.
     for name in sorted(os.listdir(runs_root)):
         p = os.path.join(runs_root, name)
         if _is_run_dir(p, checkpoint_name):
             runs.append(p)
 
-    # Second pass: one-level nested (only if none found at top-level)
+    # Some sweeps add one extra folder level.
     if len(runs) == 0:
         for name in sorted(os.listdir(runs_root)):
             p = os.path.join(runs_root, name)
@@ -287,10 +239,6 @@ def _normalize_task_name(task: Any) -> str:
 
 
 def _accum_add(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-    """
-    Add src accumulators into dst (in-place).
-    Assumes compatibility already checked.
-    """
     dst["cam_sum"] += src["cam_sum"]
     dst["cam_sq_sum"] += src["cam_sq_sum"]
     dst["chan_sum"] += src["chan_sum"]
@@ -307,13 +255,7 @@ def _process_single_run(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Dict[str, Any]:
-    """
-    Runs the original per-run Grad-CAM aggregation over the run's validation set,
-    and returns CPU accumulators:
-      cam_sum, cam_sq_sum, chan_sum, chan_sq_sum, n_total,
-      plus spatiotemporal: slices, slice_times_sec, topo_sum, topo_sq_sum
-      and metadata: T_in_ref, n_channels, task_name
-    """
+    """Run Grad-CAM for one experiment folder and return CPU accumulators."""
     config_path = os.path.join(run_dir, "config.json")
     split_path = os.path.join(run_dir, "split.json")
     ckpt_name = "best_checkpoint.pt" if args.checkpoint == "best" else "last_checkpoint.pt"
@@ -322,7 +264,7 @@ def _process_single_run(
     cfg = load_json(config_path)
     split_info = load_json(split_path)
 
-    # --- Read config ---
+    # Pull the training settings back out of the saved config.
     chisco_root = cfg_get(cfg, "chisco_root")
     sent_emb_path = cfg_get(cfg, "sent_emb_path")
     task = cfg_get(cfg, "task")
@@ -343,25 +285,14 @@ def _process_single_run(
     n_blocks = cfg_get(cfg, "n_blocks")
     latent_dim = cfg_get(cfg, "latent_dim")
     pooling = cfg_get(cfg, "pooling")
-    # Removing so this works with proper split stuff
-    # # --- Enforce explicit indices saved in split.json ---
-    # if "train_idx" not in split_info or "val_idx" not in split_info:
-    #     mode = split_info.get("split_mode", "unknown")
-    #     raise KeyError(
-    #         f"CRITICAL ERROR: 'train_idx' or 'val_idx' not found in split.json. "
-    #         f"Evaluation for mode '{mode}' cannot proceed safely."
-    #     )
-    # val_idx = split_info["val_idx"]
-    # if not val_idx:
-    #     raise ValueError("The 'val_idx' list in split.json is empty.")
 
-    # --- Load sentence embeddings ---
+    # Sentence embeddings are stored as JSON lists.
     sent2emb = load_sentence_embeddings(sent_emb_path)
     if len(sent2emb) == 0:
         raise RuntimeError(f"No sentence embeddings found at {sent_emb_path}")
     text_dim = int(next(iter(sent2emb.values())).shape[0])
 
-    # --- Dataset (streaming) ---
+    # Use the same dataset setup as training, but keep augmentation off.
     base_ds = ChiscoStreamingDataset(
         root=chisco_root,
         task=task,
@@ -374,7 +305,7 @@ def _process_single_run(
         channel_dropout_p=float(cfg.get("channel_dropout_p", 0.05)),
     )
 
-    # --- Build TEST indices from split.json ---
+    # The split file may store either sentences or raw indices.
     if "test_sentences" in split_info:
         val_idx = indices_from_sentence_split(
             base_ds.sentences,
@@ -388,7 +319,7 @@ def _process_single_run(
     if not val_idx:
         raise ValueError("Test split produced no samples.")
 
-    # Sanity check indices
+    # Fail early if the saved split no longer matches the dataset order.
     n_samples = len(base_ds)
     if any((i < 0 or i >= n_samples) for i in val_idx):
         raise ValueError("val_idx contains out-of-range indices for the current dataset ordering.")
@@ -407,7 +338,7 @@ def _process_single_run(
         pin_memory=bool(args.pin_memory),
     )
 
-    # --- Model ---
+    # Recreate the exact model shape before loading the checkpoint.
     model = EEGToTextEmbedModel(
         n_channels=n_channels,
         n_subjects=n_subjects,
@@ -431,7 +362,7 @@ def _process_single_run(
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    # --- Grad-CAM over entire validation set ---
+    # Accumulate enough statistics to save means and SEM later.
     cammer = TemporalGradCAM(model)
 
     cam_sum = None
@@ -441,10 +372,10 @@ def _process_single_run(
     n_total = 0
     T_in_ref = None
 
-    # Spatiotemporal accumulators (initialized once we know T)
+    # Optional topomap statistics, one row per time slice.
     slices: Optional[List[Tuple[int, int]]] = None
     slice_times_sec: Optional[np.ndarray] = None
-    topo_sum = None   # (K, C) float64 on CPU
+    topo_sum = None  # (K, C), float64 on CPU
     topo_sq_sum = None
 
     max_batches = int(args.max_batches)
@@ -458,18 +389,17 @@ def _process_single_run(
             if bi % 10 == 0:
                 print(f"[{os.path.basename(run_dir)}] Grad-CAM batch {bi}/{len(val_loader)} | samples so far: {n_total}")
 
-            eeg = batch["eeg"].to(device)          # (B, C, T)
-            subj = batch["subject_id"].to(device)  # (B,)
-            text = batch["target"].to(device)      # (B, D)
+            eeg = batch["eeg"].to(device)
+            subj = batch["subject_id"].to(device)
+            text = batch["target"].to(device)
 
             cam_Tprime, sim, chan_imp, grad_abs_time = cammer.compute(eeg, subj, text)
-            # cam_Tprime: (B,T'), chan_imp: (B,C), grad_abs_time: (B,C,T)
 
             T_in = int(eeg.shape[-1])
             if T_in_ref is None:
                 T_in_ref = T_in
 
-                # init time slices for spatiotemporal
+                # Initialize time slices after seeing the true input length.
                 slices, slice_times_sec = compute_time_slices(
                     T=T_in_ref,
                     fs=float(args.fs),
@@ -488,14 +418,14 @@ def _process_single_run(
             elif T_in != T_in_ref:
                 raise RuntimeError(f"Varying T in val set: {T_in} vs {T_in_ref}")
 
-            cam_up = upsample_cam_to_input_length(cam_Tprime, T_in)  # (B, T)
+            cam_up = upsample_cam_to_input_length(cam_Tprime, T_in)
 
             B = int(cam_up.shape[0])
             n_total += B
 
-            # Temporal accumulate
-            cam_batch_sum = cam_up.sum(dim=0).detach().cpu()             # (T,)
-            cam_batch_sq_sum = (cam_up ** 2).sum(dim=0).detach().cpu()   # (T,)
+            # Temporal average and variance terms.
+            cam_batch_sum = cam_up.sum(dim=0).detach().cpu()
+            cam_batch_sq_sum = (cam_up ** 2).sum(dim=0).detach().cpu()
 
             if cam_sum is None:
                 cam_sum = cam_batch_sum.clone()
@@ -504,9 +434,9 @@ def _process_single_run(
                 cam_sum += cam_batch_sum
                 cam_sq_sum += cam_batch_sq_sum
 
-            # Spatial accumulate (time-averaged)
-            chan_batch_sum = chan_imp.sum(dim=0).detach().cpu()           # (C,)
-            chan_batch_sq_sum = (chan_imp ** 2).sum(dim=0).detach().cpu() # (C,)
+            # Channel-level saliency, averaged over time inside compute().
+            chan_batch_sum = chan_imp.sum(dim=0).detach().cpu()
+            chan_batch_sq_sum = (chan_imp ** 2).sum(dim=0).detach().cpu()
 
             if chan_sum is None:
                 chan_sum = chan_batch_sum.clone()
@@ -515,14 +445,14 @@ def _process_single_run(
                 chan_sum += chan_batch_sum
                 chan_sq_sum += chan_batch_sq_sum
 
-            # Spatiotemporal accumulate (Option 1): time-resolved input-gradient topomaps
+            # Time-resolved input-gradient topomaps.
             if (not args.no_spatiotemporal) and (topo_sum is not None) and (slices is not None):
                 for k, (lo, hi) in enumerate(slices):
-                    slice_mean = grad_abs_time[:, :, lo:hi].mean(dim=-1)  # (B,C)
+                    slice_mean = grad_abs_time[:, :, lo:hi].mean(dim=-1)
                     topo_sum[k] += slice_mean.sum(dim=0).detach().cpu().to(torch.float64)
                     topo_sq_sum[k] += (slice_mean ** 2).sum(dim=0).detach().cpu().to(torch.float64)
 
-            # free references (helps on Windows)
+            # Free a few large tensors promptly, especially useful on Windows.
             del eeg, subj, text, cam_Tprime, cam_up, chan_imp, sim, grad_abs_time
 
             if device.type == "cuda" and bi % 20 == 0:
@@ -547,8 +477,8 @@ def _process_single_run(
 
         "slices": slices,
         "slice_times_sec": slice_times_sec,
-        "topo_sum": topo_sum,           # float64
-        "topo_sq_sum": topo_sq_sum,     # float64
+        "topo_sum": topo_sum,
+        "topo_sq_sum": topo_sq_sum
     }
 
 
@@ -568,21 +498,21 @@ def _save_aggregate_plots(
     chan_sum = agg["chan_sum"]
     chan_sq_sum = agg["chan_sq_sum"]
 
-    # --- Temporal mean + SEM ---
+    # Temporal mean and SEM.
     cam_mean = cam_sum / max(n_total, 1)
     cam_var = (cam_sq_sum / max(n_total, 1)) - (cam_mean ** 2)
     cam_var = torch.clamp(cam_var, min=0.0)
     cam_std = torch.sqrt(cam_var)
     cam_sem = cam_std / (max(n_total, 1) ** 0.5)
 
-    # --- Spatial mean + SEM ---
+    # Spatial mean and SEM.
     chan_mean = chan_sum / max(n_total, 1)
     chan_var = (chan_sq_sum / max(n_total, 1)) - (chan_mean ** 2)
     chan_var = torch.clamp(chan_var, min=0.0)
     chan_std = torch.sqrt(chan_var)
     chan_sem = chan_std / (max(n_total, 1) ** 0.5)
 
-    # --- Save temporal outputs ---
+    # Save the temporal curve and its time axis.
     T = int(cam_mean.shape[0])
     x_sec = np.arange(T) / float(args.fs)
 
@@ -610,7 +540,7 @@ def _save_aggregate_plots(
     np.save(temporal_npy, cam_mean.numpy())
     np.save(temporal_t, x_sec)
 
-    # --- Save spatial outputs (bar plot + npy) ---
+    # Save the channel bar plot and raw values.
     spatial_png = os.path.join(out_dir, "gradcam_spatial_channel_val_mean.png")
     spatial_npy = os.path.join(out_dir, "gradcam_spatial_channel_val_mean.npy")
 
@@ -628,15 +558,13 @@ def _save_aggregate_plots(
 
     np.save(spatial_npy, chan_mean.numpy())
 
-    # --- OPTIONAL: single skull/topomap plot (spatial average) ---
     if can_topomap and (info_montage is not None):
         topomap_png = os.path.join(out_dir, "gradcam_spatial_topomap.png")
         try:
             v = chan_mean.numpy()
 
-            # Robust limits (less aggressive than min/max)
             vmin = float(np.min(v))
-            vmax = float(np.percentile(v, 99))  # or 99 if still too strong
+            vmax = float(np.percentile(v, 99))
             if vmax <= vmin:
                 vmax = vmin + 1e-8
 
@@ -656,7 +584,6 @@ def _save_aggregate_plots(
                     sensors=True,
                 )
             except TypeError:
-                # Fallback for older MNE versions (drop newer kwargs)
                 mne.viz.plot_topomap(
                     v,
                     info_montage,
@@ -677,26 +604,25 @@ def _save_aggregate_plots(
     else:
         print("Skipping spatial topomap (provide --montage-csv and --channels-txt to enable).")
 
-    # --- OPTIONAL: spatiotemporal topomap grid (Option 1) ---
     topo_sum = agg.get("topo_sum", None)
     topo_sq_sum = agg.get("topo_sq_sum", None)
     slice_times_sec = agg.get("slice_times_sec", None)
 
     if (not args.no_spatiotemporal) and can_topomap and (info_montage is not None) and (topo_sum is not None):
         K = topo_sum.shape[0]
-        topo_mean = (topo_sum / max(n_total, 1)).numpy()  # (K,C)
+        topo_mean = (topo_sum / max(n_total, 1)).numpy()
         topo_var = (topo_sq_sum / max(n_total, 1)) - torch.from_numpy(topo_mean).to(torch.float64) ** 2
         topo_var = torch.clamp(topo_var, min=0.0)
-        topo_sem = (torch.sqrt(topo_var) / (max(n_total, 1) ** 0.5)).numpy()  # noqa: F841  (kept for parity)
+        topo_sem = (torch.sqrt(topo_var) / (max(n_total, 1) ** 0.5)).numpy()  # noqa: F841
 
         topo_npy = os.path.join(out_dir, "gradcam_spatiotemporal_topomaps.npy")
         topo_times_npy = os.path.join(out_dir, "gradcam_spatiotemporal_times_seconds.npy")
         np.save(topo_npy, topo_mean)
         np.save(topo_times_npy, slice_times_sec)
 
-        # Plot grid with shared scale
+        # Plot all time slices with a shared scale.
         vmin = float(np.min(topo_mean))
-        vmax = float(np.percentile(topo_mean, 99))  # or 99 if still too strong
+        vmax = float(np.percentile(topo_mean, 99))
         if vmax <= vmin:
             vmax = vmin + 1e-8
 
@@ -766,7 +692,7 @@ def _save_aggregate_plots(
 def main():
     p = argparse.ArgumentParser()
 
-    # Backward compatible: either a single --run-dir OR a --runs-root containing many run dirs
+    # Keep both the old single-run path and the newer multi-run aggregation mode.
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--run-dir", type=str, default=None,
                    help="Single experiment run folder (contains config.json, split.json, best/last checkpoint)")
@@ -785,13 +711,13 @@ def main():
     p.add_argument("--max-batches", type=int, default=0,
                    help="0 = entire val set. Otherwise, limit to first N batches for quicker runs.")
 
-    # skull plot inputs
+    # Topomap inputs.
     p.add_argument("--montage-csv", type=str, default="montage.csv",
                    help="Path to montage.csv with columns: label,x,y,z (enables topomaps).")
     p.add_argument("--channels-txt", type=str, default="channels.txt",
                    help="Path to channels.txt (one channel name per line, SAME order as model input channels).")
 
-    # spatiotemporal topomap controls
+    # Spatiotemporal topomap controls.
     p.add_argument("--timeslice-sec", type=float, default=0,
                    help="Length of each time slice in seconds. If 0, uses --timeslice-count.")
     p.add_argument("--timeslice-count", type=int, default=15,
@@ -804,7 +730,7 @@ def main():
     device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
     print("Using device:", device)
 
-    # Prepare montage info if requested (shared across all aggregations)
+    # Montage info is shared by all plots in this invocation.
     info_montage = None
     can_topomap = (args.montage_csv is not None) and (args.channels_txt is not None)
     if can_topomap:
@@ -821,7 +747,7 @@ def main():
 
     ckpt_name = "best_checkpoint.pt" if args.checkpoint == "best" else "last_checkpoint.pt"
 
-    # === Mode 1: single run (original behavior) ===
+    # Mode 1: one run folder.
     if args.run_dir is not None:
         run_dir = args.run_dir
         if not _is_run_dir(run_dir, ckpt_name):
@@ -843,7 +769,7 @@ def main():
         )
         return
 
-    # === Mode 2: aggregate across many runs grouped by task ===
+    # Mode 2: many run folders, aggregated by task.
     runs_root = args.runs_root
     assert runs_root is not None
 
@@ -859,13 +785,13 @@ def main():
     by_task: Dict[str, List[Dict[str, Any]]] = {"read": [], "imagine": []}
     skipped: List[Tuple[str, str]] = []
 
-    # Process each run independently (keeps the original per-run process intact)
+    # Process runs one by one so a bad run does not kill the whole aggregation.
     for rd in run_dirs:
         try:
             res = _process_single_run(rd, args, device)
             tname = res["task_name"]
             if tname not in by_task:
-                # Keep minimal and only split read vs imagine for plotting, skip unknown tasks
+                # Only read/imagine runs are plotted here.
                 skipped.append((rd, f"unknown task '{tname}'"))
                 print(f"WARNING: skipping run (unknown task): {rd} | task={tname}")
                 continue
@@ -874,14 +800,14 @@ def main():
             skipped.append((rd, repr(e)))
             print(f"WARNING: failed run, skipping: {rd} | err={repr(e)}")
 
-    # Aggregate each task separately
+    # Save one aggregate per task.
     for task_name in ["read", "imagine"]:
         runs = by_task[task_name]
         if len(runs) == 0:
             print(f"\nNo runs to aggregate for task='{task_name}'.")
             continue
 
-        # Enforce compatibility within each task group (T, channels, and slice definitions)
+        # Runs must be shape-compatible before their sums can be combined.
         ref = runs[0]
         T_ref = ref["T_in_ref"]
         C_ref = ref["n_channels"]
@@ -890,7 +816,7 @@ def main():
         slice_times_ref = ref.get("slice_times_sec", None)
         K_ref = None if slices_ref is None else len(slices_ref)
 
-        # Initialize aggregate from the first run
+        # Start the aggregate from the first compatible run.
         agg: Dict[str, Any] = {
             "n_total": int(ref["n_total"]),
             "T_in_ref": int(T_ref) if T_ref is not None else None,
@@ -918,7 +844,7 @@ def main():
                 print(f"WARNING: skipping incompatible run (C mismatch) task={task_name}: {r['run_dir']}")
                 continue
 
-            # For spatiotemporal: require same slice count and boundaries (depends on T and args)
+            # Spatiotemporal outputs must have matching slices.
             if (agg.get("topo_sum") is not None) or (r.get("topo_sum") is not None):
                 if (agg.get("topo_sum") is None) or (r.get("topo_sum") is None):
                     skipped.append((r["run_dir"], f"spatiotemporal availability mismatch (task={task_name})"))
@@ -932,7 +858,7 @@ def main():
             _accum_add(agg, r)
             used += 1
 
-        # Output dir for aggregated plots
+        # Store aggregate outputs under the root rather than any single run.
         out_dir = os.path.join(runs_root, "plots", "gradcam_aggregate", task_name)
         print(f"\nAggregating task='{task_name}' from {used}/{len(runs)} runs -> {out_dir}")
         _save_aggregate_plots(

@@ -1,10 +1,3 @@
-# chisco_baseline_encoder.py
-#
-# Baseline architecture aligned to the original CHISCO implementation:
-# EEGcnn -> (optional) PositionalEncoding + TransformerEncoder -> pooling -> projection -> L2 normalize
-#
-# Designed to be a drop-in replacement encoder for your current EEG→text embedding pipeline.
-
 import math
 import torch
 import torch.nn as nn
@@ -124,7 +117,6 @@ class CHISCOBaselineEEGEncoder(nn.Module):
 
         if layer > 0:
             self.poscode = PositionalEncoding(feat_dim, dropout=dropout2, max_len=2000)
-            # CHISCO ref uses nhead = d_model//8; ensure >=1
             nhead = max(1, feat_dim // 8)
             enc_layer = nn.TransformerEncoderLayer(
                 d_model=feat_dim,
@@ -138,7 +130,6 @@ class CHISCOBaselineEEGEncoder(nn.Module):
             self.poscode = None
             self.encoder = None
 
-        # Map pooled feature -> latent_dim -> text_dim (same “projection head” style as your current model)
         self.proj = nn.Sequential(
             nn.Linear(feat_dim, latent_dim),
             nn.ReLU(),
@@ -147,27 +138,15 @@ class CHISCOBaselineEEGEncoder(nn.Module):
 
     def forward(self, eeg: torch.Tensor) -> torch.Tensor:
         """
-        eeg: (B, C, T) where in your pipeline C=122 and T=1651
         returns: (B, text_dim) L2-normalized
         """
         # (B, feat_dim, T')
         h = self.eegcnn(eeg)
-
-        # CHISCO ref does: hidden = eegcnn(inputs).permute(0,2,1) => (B, T', feat_dim)
         h = h.permute(0, 2, 1)  # (B, T', feat_dim)
 
         if self.layer > 0:
             h = self.poscode(h)
-            # your CHISCO dataset is fixed-length; mask is all-ones
-            # (TransformerEncoder expects True for padding positions; we have none)
             h = self.encoder(h)
-
-        # Pooling modes aligned to CHISCO reference implementation
-        if self.pooling == "flatten":
-            h = torch.flatten(h, start_dim=1)  # (B, T'*feat_dim)
-            # If you choose flatten, you'd need a different proj. We disallow for baseline fairness.
-            raise ValueError("pooling='flatten' is not supported for embedding baseline (use mean/sums/tops).")
-
         if self.pooling == "mean":
             v = h.mean(dim=1)  # (B, feat_dim)
         elif self.pooling == "sums":

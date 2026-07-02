@@ -1,34 +1,3 @@
-# k_afc_evaluation.py
-#
-# K-way forced-choice (K-AFC) evaluation:
-# For each EEG segment in the validation set, build a candidate set of size K:
-#   - 1 correct sentence
-#   - K-1 randomly sampled incorrect sentences (from full vocab)
-# Predict the candidate with highest cosine similarity to EEG embedding.
-#
-# MODIFICATION (minimal):
-#   - Support evaluating multiple top-k values in a single run (default: 5, 10, 50)
-#   - Save one curve per top-k with an appropriate chance line (chance = min(top_k, K) / K).
-#   - NEW: also save a matching "relative accuracy" curve (accuracy / chance) per top-k.
-#
-# This script is based ENTIRELY on the same working logic as your binary
-# discrimination script (choose_one_testing.py):
-#   - streaming index build
-#   - split reconstruction from split.json
-#   - sentence embedding loading from JSON (utf-8)
-#   - model construction from checkpoint/config args
-#
-# Outputs:
-#   - k_afc_results.json (per top-k, per K, per seed, mean, CI)
-#   - k_afc_curve_top5.png / top10 / top50 (accuracy vs K with chance line)
-#   - k_afc_curve_top5_relative.png / top10_relative / top50_relative (accuracy/chance vs K)
-#
-# Usage:
-#   python k_afc_evaluation.py --exp-dir <run_dir>
-#   python k_afc_evaluation.py --exp-dir <run_dir> --n-seeds 3
-#   python k_afc_evaluation.py --exp-dir <run_dir> --Ks 2 5 10 25 50 100 500 1000
-#   python k_afc_evaluation.py --exp-dir <run_dir> --topks 5 10 50
-#
 import os
 import sys
 import json
@@ -42,14 +11,14 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 import matplotlib.pyplot as plt
 
-# Same import style as your working scripts
+# Match the import setup used by the training scripts.
 sys.path.append("./ds005170")
 from data_loader import load_read_run, load_imagine_run  # type: ignore
 
 from train_script_with_split import EEGToTextEmbedModel
 
 
-# -------------------- helpers (same as working script) --------------------
+# Basic helpers
 
 def normalize_sentence(s):
     return str(s).strip()
@@ -66,7 +35,7 @@ def read_json(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 def load_sentence_embeddings(path: str) -> Dict[str, List[float]]:
-    # EXACTLY the working approach: JSON + utf-8
+    # Embeddings are stored as a regular JSON file.
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -99,10 +68,7 @@ def split_indices_from_splitinfo(
     val_split: float,
     shuffle: bool,
 ) -> Tuple[List[int], List[int]]:
-    """
-    Same split reconstruction logic as your working script:
-    supports iid / unseen_sentence / unseen_subject.
-    """
+    """Recreate the saved train/validation split from split.json."""
     mode = split_info.get("split_mode", "iid")
     n = len(sentences)
 
@@ -141,7 +107,7 @@ def split_indices_from_splitinfo(
     raise ValueError(f"Unknown split_mode in split.json: {mode}")
 
 
-# -------------------- streaming dataset (same as working script) --------------------
+# Streaming dataset
 
 @dataclass(frozen=True)
 class TrialRef:
@@ -153,9 +119,7 @@ class TrialRef:
     task: str  # "read" or "imagine"
 
 class ChiscoStreamingEvalDataset(Dataset):
-    """
-    Streaming dataset: stores only refs; loads run on-demand in __getitem__.
-    """
+    """Keep trial references in memory and load runs only when needed."""
     def __init__(self, root: str, trial_index: List[TrialRef]):
         self.root = root
         self.trial_index = trial_index
@@ -241,12 +205,10 @@ def build_streaming_index(
     return trial_index, sentences, subj_ids_t
 
 
-# -------------------- K-AFC evaluation --------------------
+# K-AFC evaluation
 
 def _sample_k_candidates(rng: np.random.Generator, true_id: int, vocab_size: int, K: int) -> List[int]:
-    """
-    Candidates: [true_id] + (K-1) random distinct negatives from full vocab.
-    """
+    """Pick one true sentence and K-1 unique distractors."""
     if K < 2:
         raise ValueError("K must be >= 2")
     if vocab_size < K:
@@ -272,13 +234,9 @@ def evaluate_k_afc(
     K: int,
     seed: int,
     batch_size: int,
-    top_k: int = 1,  # NEW
+    top_k: int = 1,
 ) -> Dict[str, float]:
-    """
-    For each trial:
-      - sample K candidates (1 true + K-1 random negatives)
-      - choose top-k by cosine similarity; correct if true is in top-k
-    """
+    """Evaluate whether the true sentence appears in the top-k candidates."""
     if top_k < 1:
         raise ValueError("--top-k must be >= 1")
 
@@ -310,7 +268,7 @@ def evaluate_k_afc(
             candidates = _sample_k_candidates(rng, int(tid), vocab_size, K)
             cand_ids = torch.tensor(candidates, device=device, dtype=torch.long)
 
-            # cosine sim because both normalized
+            # Cosine similarity, since both sides have already been normalized.
             sims = (eeg_emb[i:i+1] * text_matrix[cand_ids]).sum(dim=1)  # (K,)
 
             k_eff = min(int(top_k), len(candidates))
@@ -321,7 +279,7 @@ def evaluate_k_afc(
             total += 1
 
     acc = (correct / total * 100.0) if total > 0 else 0.0
-    # Chance for top-k in K-AFC is k/K (capped when top_k > K)
+    # Random top-k performance is k / K, capped when k is larger than K.
     chance_topk = (min(int(top_k), int(K)) / float(K) * 100.0) if K > 0 else 0.0
     return {
         "acc": float(acc),
@@ -333,9 +291,7 @@ def evaluate_k_afc(
 
 
 def _mean_ci95(accs: List[float]) -> Tuple[float, float]:
-    """
-    mean ± 95% CI half-width (normal approx) across seeds
-    """
+    """Return the mean and the half-width of a normal-approx 95% CI."""
     if len(accs) == 0:
         return 0.0, 0.0
     mean = float(np.mean(accs))
@@ -346,7 +302,7 @@ def _mean_ci95(accs: List[float]) -> Tuple[float, float]:
     return mean, 1.96 * sem
 
 
-# -------------------- main --------------------
+# Main script
 
 def main():
     ap = argparse.ArgumentParser(description="K-AFC evaluation (based on working binary discrimination script).")
@@ -366,7 +322,7 @@ def main():
         help="Candidate sizes K. Default: 2 5 10 25 50 100 500 1000 FULLVOCAB",
     )
 
-    # Top-k accuracy controls
+    # Top-k accuracy settings.
     ap.add_argument(
         "--topks",
         type=int,
@@ -374,7 +330,7 @@ def main():
         default=[5, 10, 50],
         help="Compute top-k accuracy for each k in this list (default: 5 10 50).",
     )
-    # Back-compat: allow a single --top-k to override --topks
+    # Older commands can still pass a single --top-k.
     ap.add_argument(
         "--top-k",
         type=int,
@@ -421,7 +377,7 @@ def main():
     val_split = float(cfg.get("val_split") or cfg.get("VAL_SPLIT") or 0.2)
     shuffle = bool(cfg.get("shuffle_data") if "shuffle_data" in cfg else cfg.get("SHUFFLE_DATA", True))
 
-    # 1) Build streaming index (same)
+    # Build the lightweight trial index.
     print("Building streaming index (this can take a while)...", flush=True)
     trial_index, sentences, subj_ids = build_streaming_index(
         root=chisco_root,
@@ -430,27 +386,27 @@ def main():
     )
     print(f"Index built: {len(trial_index)} trials", flush=True)
 
-    # 2) Reconstruct split (same)
+    # Rebuild the test split used by the experiment.
     val_idx = indices_from_sentence_split(
         sentences,
         split_info["test_sentences"],
     )
     print(f"Test trials: {len(val_idx)}", flush=True)
 
-    # 3) Load sentence embeddings from JSON (same)
+    # Load the candidate text embeddings.
     sent2emb = load_sentence_embeddings(sent_emb_path)
     text_matrix, id_to_sentence, sentence_to_id = build_text_embedding_matrix(sent2emb)
     vocab_size = int(text_matrix.shape[0])
     text_dim = int(text_matrix.shape[1])
     print(f"Text vocab size: {vocab_size} | text_dim={text_dim}", flush=True)
 
-    # Choose Ks
+    # Choose the candidate-set sizes to evaluate.
     if args.Ks is None:
         Ks = [100, 500, 1000, 2500, vocab_size]
     else:
         Ks = list(args.Ks)
         if vocab_size not in Ks:
-            # keep it optional; don't force
+            # Full-vocabulary evaluation is optional.
             pass
 
     Ks = [k for k in Ks if 2 <= k <= vocab_size]
@@ -462,14 +418,14 @@ def main():
     topks = [int(k) for k in (args.topks or [])]
     if args.top_k is not None:
         topks = [int(args.top_k)]
-    # sanitize
+    # Drop invalid values and keep the list stable.
     topks = sorted(set([k for k in topks if k >= 1]))
     if len(topks) == 0:
         topks = [1]
 
     print(f"Top-k(s)  : {topks}", flush=True)
 
-    # 4) Load model from checkpoint/config (same explicit-args approach as working script)
+    # Recreate the model from the checkpoint/config values.
     checkpoint = torch.load(ckpt_path, map_location=device)
     c2 = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
 
@@ -519,11 +475,11 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
 
-    # 5) Build val dataset (same)
+    # Wrap only the held-out trials.
     base_ds = ChiscoStreamingEvalDataset(root=chisco_root, trial_index=trial_index)
     val_ds = Subset(base_ds, val_idx)
 
-    # 6) Run K-AFC
+    # Run K-AFC for every requested top-k and K.
     results: Dict[str, Any] = {
         "exp_dir": exp_dir,
         "task": task,
@@ -580,13 +536,13 @@ def main():
                 flush=True,
             )
 
-    # Save JSON
+    # Save the raw numbers before plotting.
     out_json = os.path.join(exp_dir, "k_afc_results.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved: {out_json}", flush=True)
 
-    # 7) Plot (one curve per top-k)
+    # Plot one curve per top-k setting.
     for top_k in topks:
         perK = results["per_topk"][str(top_k)]["per_K"]
         Ks_arr = np.array([int(k) for k in perK.keys()], dtype=np.int64)
@@ -613,7 +569,7 @@ def main():
         plt.close()
         print(f"Saved: {out_png}", flush=True)
 
-        # --- NEW: relative accuracy plot (accuracy / chance) ---
+        # Also plot accuracy as a multiple of chance.
         eps = 1e-12
         denom = np.maximum(chances, eps)  # avoid divide-by-zero
         rel_means = means / denom

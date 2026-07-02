@@ -1,36 +1,3 @@
-#!/usr/bin/env python3
-"""
-Plot averaged retrieval metrics vs train_data_fraction for experiment folders.
-
-Folder structure:
-  <experiments_root>/
-    exp_001/
-      config.json
-      global_retrieval.json
-    exp_002/
-      config.json
-      global_retrieval.json
-    ...
-
-Produces plots in <experiments_root>/:
-  - Combined (default):
-      metrics_vs_fraction_task_imagine.png
-      metrics_vs_fraction_task_read.png
-  - Split (--split-graphs):
-      metrics_vs_fraction_task_imagine_top5.png, ...
-      metrics_vs_fraction_task_read_top5.png, ...
-
-Config must include at least:
-  - "task": "read" or "imagine"
-  - "train_data_fraction": float
-(see example)
-
-Eval JSON contains numeric metrics, including keys like top1/top5/... and "total".
-We exclude "total". We also never plot top1. (see example)
-"""
-
-from __future__ import annotations
-
 import argparse
 import json
 import math
@@ -43,7 +10,7 @@ import matplotlib.pyplot as plt
 CONFIG_NAME = "config.json"
 EVAL_NAME = "global_retrieval.json"
 
-# Total candidate pool size for chance baseline
+# Number of candidates used for the chance baseline.
 TOTAL_CANDIDATES = 6567
 
 
@@ -57,7 +24,7 @@ def is_number(x: Any) -> bool:
 
 
 def metric_sort_key(name: str) -> Tuple[int, str]:
-    # If name contains digits (e.g., top1/top5), sort by numeric part first.
+    # Sort top-k metrics by k when possible.
     digits = "".join(ch for ch in name if ch.isdigit())
     if digits:
         return (int(digits), name)
@@ -65,9 +32,7 @@ def metric_sort_key(name: str) -> Tuple[int, str]:
 
 
 def is_top1_metric(metric_name: str) -> bool:
-    """
-    Return True if this metric is a top-1 style metric (e.g., "top1", "top_1", "top-1").
-    """
+    """Return True for top1-style metric names such as top1, top_1, or top-1."""
     m = metric_name.strip().lower()
     if not m.startswith("top"):
         return False
@@ -77,9 +42,12 @@ def is_top1_metric(metric_name: str) -> bool:
 
 def chance_for_metric(metric_name: str) -> float | None:
     """
-    Return chance accuracy as a *percentage* for topK-style metrics:
-      chance_percent = 100 * K / TOTAL_CANDIDATES
-    If metric_name doesn't contain a numeric K (e.g., "mrr"), return None.
+    Return chance accuracy as a percentage for top-k metrics.
+
+    For example, top5 chance is:
+      100 * 5 / TOTAL_CANDIDATES
+
+    Metrics without a numeric k, such as mrr, return None.
     """
     digits = "".join(ch for ch in metric_name if ch.isdigit())
     if not digits:
@@ -92,9 +60,9 @@ def chance_for_metric(metric_name: str) -> float | None:
 
 def to_relative_accuracy(metric_name: str, value: float) -> float:
     """
-    Convert an accuracy metric to relative accuracy (accuracy / chance),
-    where chance is expressed as a percentage (so value should also be in percent).
-    If chance can't be computed, return value unchanged.
+    Convert a percentage accuracy into accuracy-over-chance.
+
+    If the metric does not have a chance baseline, the value is returned unchanged.
     """
     chance = chance_for_metric(metric_name)
     if chance is None or chance == 0.0:
@@ -109,17 +77,17 @@ def main() -> None:
         "--plot-mode",
         choices=["absolute", "relative"],
         default="relative",
-        help="Plot absolute accuracy (raw metric values) or relative accuracy (accuracy / chance). Default: relative.",
+        help="Plot raw accuracy or accuracy divided by chance. Default: relative.",
     )
     ap.add_argument(
         "--split-graphs",
         action="store_true",
-        help="If set, produce a separate graph for each metric (per task). Default: combined.",
+        help="Create a separate graph for each metric and task. Default: combined.",
     )
     ap.add_argument(
         "--show",
         action="store_true",
-        help="Display figures interactively (in addition to saving)",
+        help="Display figures interactively as well as saving them.",
     )
     args = ap.parse_args()
 
@@ -127,10 +95,9 @@ def main() -> None:
     if not root.exists():
         raise SystemExit(f"Root folder does not exist: {root}")
 
-    # Save plots in the same folder as the experiments (the root folder)
     outdir = root
 
-    # grouped[(task, frac)][metric] -> list of values
+    # grouped[(task, fraction)][metric] -> list of values
     grouped: Dict[Tuple[str, float], Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
     all_metric_names = set()
 
@@ -168,7 +135,7 @@ def main() -> None:
         task = task.strip().lower()
         frac_f = float(frac)
 
-        # Metrics: numeric keys excluding "total" and excluding top1 entirely
+        # Keep numeric metrics, but skip totals and top1.
         for k, v in ev.items():
             if k == "total":
                 continue
@@ -199,7 +166,6 @@ def main() -> None:
     def y_label(metric_name: str | None = None) -> str:
         if args.plot_mode == "relative":
             return "relative accuracy (accuracy / chance)"
-        # absolute
         return metric_name if metric_name else "accuracy"
 
     def fig_suffix() -> str:
@@ -215,7 +181,7 @@ def main() -> None:
         else:
             plt.close()
 
-    # -------- NEW: compute global y-limits across BOTH tasks (so axes match) --------
+    # Compute one shared y-axis range so read and imagine plots are comparable.
     global_y_min = float("inf")
     global_y_max = float("-inf")
 
@@ -234,13 +200,11 @@ def main() -> None:
     if global_y_min == float("inf") or global_y_max == float("-inf"):
         raise SystemExit("No plottable metric values found after filtering (e.g., top1 removal).")
 
-    # optional padding to avoid touching plot border
     pad = 0.05 * (global_y_max - global_y_min) if global_y_max > global_y_min else 1.0
     ylim_low = global_y_min - pad
     ylim_high = global_y_max + pad
-    # ------------------------------------------------------------------------------
 
-    # Plot per task
+    # Make plots for each task.
     for task in ["imagine", "read"]:
         fracs = sorted({frac for (t, frac) in grouped.keys() if t == task})
         if not fracs:
@@ -248,7 +212,6 @@ def main() -> None:
             continue
 
         if not args.split_graphs:
-            # Combined plot per task
             plt.figure()
             for metric in metrics_sorted:
                 xs, ys = [], []
@@ -267,14 +230,11 @@ def main() -> None:
             plt.grid(True, linewidth=0.5, alpha=0.5)
             plt.legend()
 
-            # -------- NEW: lock y-axis to be the same across tasks --------
             plt.ylim(ylim_low, ylim_high)
-            # -------------------------------------------------------------
 
             save_or_show(f"metrics_vs_fraction_task_{task}_{fig_suffix()}.png")
 
         else:
-            # Split: separate plot per metric per task
             for metric in metrics_sorted:
                 xs, ys = [], []
                 for frac in fracs:
@@ -294,16 +254,12 @@ def main() -> None:
                 plt.title(f"{metric} vs train_data_fraction (task={task}, mode={args.plot_mode})")
                 plt.grid(True, linewidth=0.5, alpha=0.5)
 
-                # -------- NEW: lock y-axis to be the same across tasks --------
                 plt.ylim(ylim_low, ylim_high)
-                # -------------------------------------------------------------
 
-                # Safe-ish filename
                 metric_safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in metric)
                 save_or_show(f"metrics_vs_fraction_task_{task}_{metric_safe}_{fig_suffix()}.png")
 
     print("Done.")
-
 
 
 if __name__ == "__main__":
