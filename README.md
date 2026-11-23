@@ -1,470 +1,158 @@
 # CHISCO EEG-to-Text Decoding
 
-Deep learning models for open-vocabulary EEG-to-text decoding on the CHISCO dataset, supporting both **stimulus-driven reading** and **imagined speech (recall)** paradigms.
+Code for decoding sentences from EEG on the [CHISCO dataset](https://github.com/zhangzihan-is-good/Chisco), for both **reading** and **imagined speech** (recall).
 
-This repository extends the original CHISCO framework with improved EEG encoders, sentence-aligned train/validation/test splits, large-scale retrieval evaluation, semantic analysis, interpretability tools, and systematic ablation studies.
+An EEG encoder is trained with a contrastive (CLIP-style) loss to map each trial into the embedding space of a frozen Chinese BERT, so that the sentence a participant read or imagined can be retrieved from their brain activity. The repository includes the training code, a re-implementation of the original CHISCO encoder as a baseline, and the evaluation and analysis scripts used in the paper.
 
----
+## Model
 
-# Overview
+The main encoder combines:
 
-The goal of this project is to learn a shared embedding space between EEG recordings and natural language sentence embeddings, enabling retrieval of semantically relevant sentences directly from brain activity.
+- an EEGNet-style front end (temporal convolution + depthwise spatial convolution),
+- spatial attention over sensors, a subject-specific layer, and residual dilated convolution blocks, following the brain module of Défossez et al. (2023), *Decoding speech perception from non-invasive brain recordings*, Nature Machine Intelligence,
+- temporal pooling and an MLP projection into the 768-d sentence-embedding space.
 
-Two paradigms are supported:
+Each component can be switched off from the command line for ablations.
 
-- **Read** — participants read presented sentences.
-- **Imagine** — participants internally recalled and imagined previously presented sentences.
-
-The primary architecture combines:
-
-- EEGNet-inspired feature extraction
-- Spatial attention over electrodes
-- Subject-specific adaptation layers
-- Residual dilated temporal convolution blocks
-- Projection into sentence embedding space
-
-A faithful reproduction of the original CHISCO architecture is also included as a baseline.
-
----
-
-# Repository Structure
+## Repository layout
 
 ```text
-.
-├── train_script_with_split.py
-├── eval_global_retrieval.py
-├── k_afc_evaluation.py
-├── k_afc_evaluation_multi.py
-├── semantic_hypothesis_testing.py
-├── GRADCAM.py
-├── subject_variance.py
-├── plot_data_scaling.py
-├── summarize_augmentation_results.py
-│
-├── Brain_Module.py
-├── model_parts.py
-├── CHISCO_baseline_model.py
-├── simple_experiment_logger.py
-│
-├── splits/
-│   └── train_val_test_split.json
-│
-└── ds005170/
+train.py                    Train a model (main entry point)
+eeg2text/                   Shared code
+  data.py                     Loading CHISCO trials, datasets, augmentation
+  model.py                    Full model + build_model(config)
+  brain_module.py             BrainModule
+  model_parts.py              Front end, spatial attention, subject layer, residual blocks
+  chisco_baseline.py          CHISCO baseline encoder
+  experiment_logger.py        Run folders, checkpoints, metrics
+  eval_utils.py               Helpers shared by evaluation scripts
+evaluation/
+  global_retrieval.py         Retrieval against the full sentence corpus
+  k_afc.py                    K-alternative forced choice
+  semantic_enrichment.py      Are retrieved sentences from the target's semantic category?
+  random_noise_baseline.py    Empirical chance level with noise input
+analysis/
+  gradcam.py                  Temporal Grad-CAM and channel / scalp saliency
+  subject_variance.py         Between- vs within-subject structure of the EEG
+plotting/
+  plot_data_scaling.py        Accuracy vs amount of training data
+  plot_kafc_curves.py         K-AFC curves aggregated over runs
+scripts/
+  precompute_embeddings.py    Sentence embeddings used as training targets
+splits/
+  train_val_test_split.json   Fixed sentence-level train / val / test split
+resources/
+  montage.csv                 Electrode positions, for topomaps
 ```
 
----
+All commands below are run from the repository root.
 
-# Installation
-
-Create a Python environment and install dependencies:
+## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Main dependencies:
+### Data
 
-- PyTorch
-- Transformers
-- NumPy
-- SciPy
-- scikit-learn
-- Matplotlib
-- Pandas
-- HuggingFace Transformers
-
----
-
-# Dataset
-
-This repository assumes access to the CHISCO dataset:
-
-```text
-ds005170/
-```
-
-Sentence embeddings should be provided as:
-
-```text
-ds005170/json/sentence_bert_embs.json
-```
-
-with format:
-
-```json
-{
-  "sentence text": [0.1, 0.2, ...]
-}
-```
-
----
-
-# Training
-
-The primary training entry point is:
+Download CHISCO ([OpenNeuro ds005170](https://doi.org/10.18112/openneuro.ds005170.v1.1.2)) into `ds005170/`, for example:
 
 ```bash
-python train_script_with_split.py
+aws s3 sync --no-sign-request s3://openneuro.org/ds005170 ds005170
 ```
 
-Example:
+The code uses the preprocessed pickles in `ds005170/derivatives/preprocessed_pkl/` and the sentence metadata in `ds005170/json/`. Then compute the sentence-embedding targets (the `[CLS]` vector of `bert-base-chinese` for every sentence):
 
 ```bash
-python train_script_with_split.py \
-  --task read \
-  --seed 4 \
-  --split-file splits/train_val_test_split.json
+python -m scripts.precompute_embeddings
 ```
 
-For imagined speech:
+This writes `ds005170/json/sentence_bert_embs.json`.
+
+## Data split
+
+All experiments use the fixed split in `splits/train_val_test_split.json`, made at the **sentence** level (80 / 10 / 10 %), so test sentences are never seen during training. The same sentences are held out for reading and imagined speech, so the two tasks are directly comparable.
+
+## Training
 
 ```bash
-python train_script_with_split.py \
-  --task imagine \
-  --seed 4 \
-  --split-file splits/train_val_test_split.json
+python train.py --task read --seed 4
+python train.py --task imagine --seed 4
 ```
 
----
-
-# Sentence-Aligned Train / Validation / Test Splits
-
-All experiments use a fixed sentence-aligned split:
-
-```text
-Train      80%
-Validation 10%
-Test       10%
-```
-
-The same sentence assignment is used across both read and imagine paradigms, ensuring direct comparability between tasks.
-
-Each experiment stores:
-
-```json
-{
-  "train_sentences": [...],
-  "val_sentences": [...],
-  "test_sentences": [...]
-}
-```
-
-inside:
-
-```text
-split.json
-```
-
-allowing exact reconstruction of evaluation datasets.
-
----
-
-# Experiment Logging
-
-Training automatically creates experiment folders:
-
-```text
-experiments/
-└── read/
-    └── 2026-04-28_16-23-51__split=sentence_aligned_read_imagine__seed=4/
-```
-
-Each run contains:
-
-```text
-config.json
-split.json
-metrics.jsonl
-best_checkpoint.pt
-best_summary.json
-last_checkpoint.pt
-```
-
-This enables fully reproducible experiments.
-
----
-
-# Architectures
-
-## Full Model
-
-The default architecture combines:
-
-- EEGNet-style front-end
-- Spatial attention
-- Subject adaptation layer
-- Residual dilated temporal convolutions
-- Projection head
-
-## CHISCO Baseline
-
-A reproduction of the original CHISCO architecture can be trained via:
+The CHISCO baseline:
 
 ```bash
-python train_script_with_split.py \
-  --task read \
-  --arch chisco_baseline \
-  --split-file splits/train_val_test_split.json
+python train.py --task read --arch chisco_baseline
 ```
 
-or
+Each run gets its own folder, `experiments/eeg2text/<task>/<split>/<timestamp>__split=...__seed=.../`, containing `config.json`, `split.json`, `metrics.jsonl`, `best_checkpoint.pt` (best validation Acc@10), `last_checkpoint.pt` and training curves. At the end of training the best checkpoint is evaluated once on the test split.
+
+We report the mean and 95% CI over seeds 4, 6, 8, 10 and 12.
+
+Useful options (see `python train.py --help` for all):
+
+| Option | Purpose |
+|---|---|
+| `--no-use-frontend`, `--no-use-eegnet`, `--no-use-brainmodule`, `--no-use-spatial-attn`, `--no-use-subject-layer`, `--no-use-residual-blocks` | Ablations |
+| `--train-data-fraction 0.5` | Train on a random subset of the training trials |
+| `--noise-std`, `--jitter-max`, `--channel-dropout-p`, `--no-augment-train` | Data augmentation (Gaussian noise, circular time shift, channel dropout) |
+
+## Evaluation
+
+All evaluation scripts use the held-out **test** split recorded in the run's `split.json` and the run's `best_checkpoint.pt`.
+
+**Global retrieval**: rank all 6,567 corpus sentences for each test trial and report top-1/5/10/50 accuracy. Writes `global_retrieval.json` and per-trial results to `global_retrieval_trials.json`.
 
 ```bash
-python train_script_with_split.py \
-  --task imagine \
-  --arch chisco_baseline \
-  --split-file splits/train_val_test_split.json
+python -m evaluation.global_retrieval --exp-dir <run folder>
 ```
 
----
-
-# Global Retrieval Evaluation
-
-Evaluate retrieval against the entire sentence corpus:
+**K-AFC**: the true sentence plus K−1 random distractors; top-k accuracy as K grows. Writes `k_afc_results.json` and curves to the run folder. To aggregate runs into one figure per task:
 
 ```bash
-python eval_global_retrieval.py \
-  --exp-dir <experiment_folder>
+python -m evaluation.k_afc --exp-dir <run folder>
+python -m plotting.plot_kafc_curves --exp-root experiments/eeg2text
 ```
 
-Outputs:
-
-```text
-global_retrieval.json
-```
-
-containing:
-
-```json
-{
-  "top1": 0.054,
-  "top5": 0.353,
-  "top10": 0.678,
-  "top50": 2.639
-}
-```
-
-Evaluation is performed on the held-out test set reconstructed from the experiment's saved split file.
-
----
-
-# K-AFC Evaluation
-
-Evaluate K-way forced-choice retrieval:
+**Semantic enrichment**: how often the top-k retrieved sentences share the target's semantic category, compared with chance (hypergeometric null, one-sided test).
 
 ```bash
-python k_afc_evaluation.py \
-  --exp-dir <experiment_folder>
+python -m evaluation.semantic_enrichment --exp-root experiments/eeg2text
 ```
 
-Outputs:
-
-```text
-k_afc_results.json
-k_afc_curve_top5.png
-k_afc_curve_top10.png
-k_afc_curve_top50.png
-
-k_afc_curve_top5_relative.png
-k_afc_curve_top10_relative.png
-k_afc_curve_top50_relative.png
-```
-
-To aggregate across multiple runs:
+**Random-noise baseline**: the same retrieval with the EEG replaced by Gaussian noise, giving an empirical chance level.
 
 ```bash
-python k_afc_evaluation_multi.py \
-  --exp-root <folder>
+python -m evaluation.random_noise_baseline --exp-root experiments/eeg2text
 ```
 
----
+Scripts that take `--exp-root` search it recursively for run folders, evaluate each one and also save a summary with the mean ± 95% CI per task.
 
-# Random Noise Baseline
+## Analysis
 
-Evaluate retrieval under random EEG input:
+**Grad-CAM**: temporal Grad-CAM on the BrainModule output, and input-gradient saliency per channel and over time, averaged over test trials (and over runs with `--runs-root`). Scalp topomaps additionally need a text file listing the 122 model input channels in order:
 
 ```bash
-python test_random_noise.py \
-  --exp-root <folder>
+python -m analysis.gradcam --runs-root experiments/eeg2text --channels-txt channels.txt
 ```
 
-This establishes empirical chance-level performance under identical evaluation conditions.
-
----
-
-# Semantic Analysis
-
-Semantic category preservation is evaluated via:
+**Subject variance**: each trial is represented by its log-Euclidean channel-correlation matrix; we compare between-subject and within-subject spread for reading vs imagined speech (centroid distances, silhouette scores, bootstrap CIs).
 
 ```bash
-python semantic_hypothesis_testing.py
+python -m analysis.subject_variance --outdir covcorr_report
 ```
 
-The analysis tests whether retrieved sentences belong to the same semantic category as the target sentence more frequently than expected under chance.
-
----
-
-# Interpretability
-
-Grad-CAM analysis:
+**Data scaling**: after training and evaluating runs with different `--train-data-fraction` values,
 
 ```bash
-python GRADCAM.py \
-  --exp-root <folder>
+python -m plotting.plot_data_scaling --root <folder with those runs>
 ```
 
-Produces:
+## Citation
 
-- Temporal saliency maps
-- Channel importance maps
-- Topographic scalp visualisations
-- Spatiotemporal attribution analyses
+If you use this code, please also cite the CHISCO dataset:
 
-for both read and imagine paradigms.
+> Zhang, Z., Zhao, Y., Bao, Y., & Ding, X. *Chisco: An EEG-based BCI dataset for decoding of imagined speech.* Dataset: [doi:10.18112/openneuro.ds005170.v1.1.2](https://doi.org/10.18112/openneuro.ds005170.v1.1.2)
 
----
-
-# Subject Variance Analysis
-
-To investigate subject-specific structure:
-
-```bash
-python subject_variance.py
-```
-
-This computes covariance-based representations and compares inter-subject geometry using:
-
-- Correlation embeddings
-- Log-Euclidean geometry
-- Incremental PCA
-- Silhouette analysis
-
----
-
-# Data Scaling Experiments
-
-Train using fractions of the training set:
-
-```bash
---train-data-fraction 0.1
---train-data-fraction 0.2
-...
---train-data-fraction 1.0
-```
-
-Example:
-
-```bash
-python train_script_with_split.py \
-  --task read \
-  --train-data-fraction 0.5 \
-  --split-file splits/train_val_test_split.json
-```
-
-Visualise results:
-
-```bash
-python plot_data_scaling.py
-```
-
----
-
-# Data Augmentation
-
-Supported augmentations:
-
-## Gaussian Noise
-
-```bash
---noise-std
-```
-
-## Temporal Jitter
-
-```bash
---jitter-max
-```
-
-## Channel Dropout
-
-```bash
---channel-dropout-p
-```
-
-Disable all augmentation:
-
-```bash
---no-augment-train
-```
-
----
-
-# Reproducibility
-
-All experiments store:
-
-- Configuration
-- Random seed
-- Dataset split
-- Checkpoints
-- Validation metrics
-- Training curves
-
-Recommended seeds:
-
-```text
-4
-6
-8
-10
-12
-```
-
-for reporting mean performance and 95% confidence intervals.
-
----
-
-# Example Workflow
-
-Train:
-
-```bash
-python train_script_with_split.py \
-  --task read \
-  --seed 4 \
-  --split-file splits/train_val_test_split.json
-```
-
-Evaluate retrieval:
-
-```bash
-python eval_global_retrieval.py \
-  --exp-dir experiments/read/<run>
-```
-
-Run K-AFC:
-
-```bash
-python k_afc_evaluation.py \
-  --exp-dir experiments/read/<run>
-```
-
-Run semantic analysis:
-
-```bash
-python semantic_hypothesis_testing.py \
-  --exp-root experiments/read
-```
-
-Generate Grad-CAM visualisations:
-
-```bash
-python GRADCAM.py \
-  --exp-root experiments/read
-```
-
----
-
-```
-
-In addition, please cite the original CHISCO dataset paper.
+<!-- Add the BibTeX for this paper here. -->

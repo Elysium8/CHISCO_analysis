@@ -1,0 +1,16 @@
+# Dataset (download from OpenNeuro, see README)
+ds005170/derivatives/
+ds005170/json/
+ds005170/sub-*/
+
+# Training runs and analysis outputs
+experiments/
+covcorr_report/
+*.pt
+
+# Python / editors
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+.DS_Store
